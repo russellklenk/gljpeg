@@ -1,0 +1,105 @@
+@ECHO OFF
+
+SET LIBJPEGVER=jpeg-9b
+SET LIBJPEGSRC="%~dp03rdparty\%LIBJPEGVER%"
+SET LIBJPEGOUT="%~dp03rdparty\build"
+SET LIBJPEGLIB="%~dp03rdparty\build\libjpeg.lib"
+SET LIBJPEGPDB="%~dp03rdparty\build\libjpeg.pdb"
+
+SETLOCAL
+SET VSVERSION_2013=12.0
+SET VSVERSION_2015=14.0
+SET VSVERSION=%VSVERSION_2015%
+IF NOT DEFINED DevEnvDir (
+    CALL "C:\Program Files (x86)\Microsoft Visual Studio %VSVERSION%\VC\vcvarsall.bat" x86_amd64
+)
+
+SET INCLUDES=-I%LIBJPEGSRC%
+
+SET DEFINES_DEBUG=/D WINVER=0x0601 /D _WIN32_WINNT=0x0601 /D DEBUG /D _DEBUG /D UNICODE /D _UNICODE /D _STDC_FORMAT_MACROS /D _CRT_SECURE_NO_WARNINGS
+SET CPPFLAGS_DEBUG=%INCLUDES% /FC /nologo /W4 /WX /wd4505 /wd4100 /wd4244 /wd4267 /wd4127 /Zi /Fd%LIBJPEGPDB% /EHsc /Od
+SET LINKFLAGS_DEBUG=/MTd
+
+SET DEFINES_RELEASE=/D WINVER=0x0601 /D _WIN32_WINNT=0x0601 /D UNICODE /D _UNICODE /D _STDC_FORMAT_MACROS /D _CRT_SECURE_NO_WARNINGS
+SET CPPFLAGS_RELEASE=%INCLUDES% /FC /nologo /W4 /WX /wd4505 /wd4100 /wd4244 /wd4267 /wd4127 /Zi /Fd%LIBJPEGPDB% /EHsc /Ob2it
+SET LINKFLAGS_RELEASE=/MT
+
+IF [%1] NEQ [] (
+    IF "%1" == "debug" (
+        SET DEFINES=%DEFINES_DEBUG%
+        SET CPPFLAGS=%CPPFLAGS_DEBUG%
+        SET LNKFLAGS=%LINKFLAGS_DEBUG%
+        ECHO Building debug configuration...
+    ) ELSE (
+        SET DEFINES=%DEFINES_RELEASE%
+        SET CPPFLAGS=%CPPFLAGS_RELEASE%
+        SET LNKFLAGS=%LINKFLAGS_RELEASE%
+        ECHO Building release configuration - did you mean to specify "debug"?
+    )
+) ELSE (
+    SET DEFINES=%DEFINES_RELEASE%
+    SET CPPFLAGS=%CPPFLAGS_RELEASE%
+    SET LNKFLAGS=%LINKFLAGS_RELEASE%
+    ECHO Building release configuration...
+)
+
+IF NOT EXIST %LIBJPEGOUT% MKDIR %LIBJPEGOUT%
+
+PUSHD %LIBJPEGSRC%
+ECHO Copy jconfig.vc to jconfig.h...
+COPY jconfig.vc jconfig.h
+POPD
+
+PUSHD %LIBJPEGOUT%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jaricom.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcapimin.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcapistd.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcarith.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jccoefct.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jccolor.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcdctmgr.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jchuff.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcinit.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcmainct.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcmarker.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcmaster.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcomapi.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcparam.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcprepct.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jcsample.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jctrans.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdapimin.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdapistd.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdarith.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdatadst.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdatasrc.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdcoefct.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdcolor.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jddctmgr.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdhuff.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdinput.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdmainct.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdmarker.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdmaster.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdmerge.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdpostct.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdsample.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jdtrans.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jerror.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jfdctflt.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jfdctfst.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jfdctint.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jidctflt.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jidctfst.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jidctint.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jquant1.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jquant2.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jutils.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jmemmgr.c %DEFINES%
+cl /c %CPPFLAGS% %LIBJPEGSRC%\jmemnobs.c %DEFINES%
+lib /NOLOGO /OUT:%LIBJPEGLIB% *.obj
+POPD
+ENDLOCAL
+
+@ECHO Build complete.
+
