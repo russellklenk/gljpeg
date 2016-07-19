@@ -56,6 +56,7 @@ PUSHD %GLJPEGOUT%
 cl %CPPFLAGS% ..\src\main.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fe%GLJPEGEXE%
 cl %CPPFLAGS% ..\src\dbenchst.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedbenchst.exe
 cl %CPPFLAGS% ..\src\dbenchmt.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedbenchmt.exe
+cl %CPPFLAGS% ..\src\decodemt.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedecodemt.exe
 POPD
 
 GOTO BUILD_COMPLETE
