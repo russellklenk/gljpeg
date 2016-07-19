@@ -191,7 +191,7 @@ ExtractSortKey
     for ( ; ; )
     {   // convert the first part of the extension to a decimal integer.
         WCHAR ch = *ext++;
-        if ((ch <= L'0') || (ch >= L'9'))
+        if ((ch < L'0') || (ch > L'9'))
             break;
         key = (key * 10) + (ch - L'0');
     }
@@ -392,48 +392,39 @@ IoSortFileList
 
 /// @summary Load the entire contents of a file into memory.
 /// @param data The FILE_DATA instance to populate.
-/// @param path The zero-terminated UTF-8 path of the file to load.
+/// @param path The zero-terminated UTF-16 path of the file to load.
 /// @return Zero if the file is loaded successfully, or -1 if an error occurred.
 public_function int
 IoLoadFileData
 (
-    FILE_DATA  *data,
-    char const *path
+    FILE_DATA   *data,
+    WCHAR const *path
 )
 {
     LARGE_INTEGER file_size = {};
     HANDLE     fd = INVALID_HANDLE_VALUE;
-    WCHAR  *wpath = NULL;
     void     *buf = NULL;
-    size_t  pchar = 0;
-    size_t  pbyte = 0;
     size_t     nb = 0;
     int64_t    nr = 0;
 
     // initialize the fields of the FILE_DATA structure.
     ZeroMemory(data, sizeof(FILE_DATA));
 
-    // convert the path from UTF-8 input to the native system encoding.
-    if ((wpath = Utf8toUtf16(path, pchar, pbyte)) == NULL)
-    {
-        ConsoleError("ERROR: %S(%u): Unable to convert input path \"%S\" to UTF-16.\n", __FUNCTION__, GetCurrentThreadId(), path);
-        goto cleanup_and_fail;
-    }
     // open the requested input file, read-only, to be read from start to end.
-    if ((fd = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL)) == INVALID_HANDLE_VALUE)
+    if ((fd = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL)) == INVALID_HANDLE_VALUE)
     {
-        ConsoleError("ERROR: %S(%u): Unable to open input file \"%S\" (%08X).\n", __FUNCTION__, GetCurrentThreadId(), path, GetLastError());
+        ConsoleError("ERROR: %S(%u): Unable to open input file \"%s\" (%08X).\n", __FUNCTION__, GetCurrentThreadId(), path, GetLastError());
         goto cleanup_and_fail;
     }
     // retrieve the file size, and use that to allocate a buffer for the file data.
     if (!GetFileSizeEx(fd, &file_size))
     {
-        ConsoleError("ERROR: %S(%u): Failed to retrieve file size for input file \"%S\" (%08X).\n", __FUNCTION__, GetCurrentThreadId(), path, GetLastError());
+        ConsoleError("ERROR: %S(%u): Failed to retrieve file size for input file \"%s\" (%08X).\n", __FUNCTION__, GetCurrentThreadId(), path, GetLastError());
         goto cleanup_and_fail;
     }
     if ((nb = (size_t) file_size.QuadPart) == 0 || (buf = malloc(nb)) == NULL)
     {
-        ConsoleError("ERROR: %S(%u): Failed to allocate %Iu byte input buffer for file \"%S\".\n", __FUNCTION__, GetCurrentThreadId(), nb, path);
+        ConsoleError("ERROR: %S(%u): Failed to allocate %Iu byte input buffer for file \"%s\".\n", __FUNCTION__, GetCurrentThreadId(), nb, path);
         goto cleanup_and_fail;
     }
     // read the entire file contents into the buffer, in 1MB chunks.
@@ -445,7 +436,7 @@ IoLoadFileData
         DWORD bytes_read = 0;
         if (!ReadFile(fd, dst, to_read, &bytes_read, NULL))
         {   // the read failed. treat this as a fatal error.
-            ConsoleError("ERROR: %S(%u): ReadFile failed for input file \"%S\", offset %I64d (%08X).\n", __FUNCTION__, GetCurrentThreadId(), path, nr, GetLastError());
+            ConsoleError("ERROR: %S(%u): ReadFile failed for input file \"%s\", offset %I64d (%08X).\n", __FUNCTION__, GetCurrentThreadId(), path, nr, GetLastError());
             goto cleanup_and_fail;
         }
         else
@@ -455,7 +446,6 @@ IoLoadFileData
     }
     // the file was successfully read, so clean up and set the fields on the FILE_DATA.
     CloseHandle(fd);
-    free(wpath);
     data->Buffer   =(uint8_t*) buf;
     data->MapPtr   = NULL;
     data->Offset   = 0;
@@ -467,8 +457,35 @@ cleanup_and_fail:
     ZeroMemory(data, sizeof(FILE_DATA));
     if (fd != INVALID_HANDLE_VALUE) CloseHandle(fd);
     if (buf != NULL) free(buf);
-    if (wpath != NULL) free(wpath);
     return -1;
+}
+
+/// @summary Load the entire contents of a file into memory.
+/// @param data The FILE_DATA instance to populate.
+/// @param path The zero-terminated UTF-8 path of the file to load.
+/// @return Zero if the file is loaded successfully, or -1 if an error occurred.
+public_function int
+IoLoadFileData
+(
+    FILE_DATA  *data,
+    char const *path
+)
+{
+    WCHAR  *wpath = NULL;
+    size_t  pchar = 0;
+    size_t  pbyte = 0;
+    int       res = -1;
+
+    // convert the path from UTF-8 input to the native system encoding.
+    if ((wpath = Utf8toUtf16(path, pchar, pbyte)) == NULL)
+    {
+        ConsoleError("ERROR: %S(%u): Unable to convert input path \"%S\" to UTF-16.\n", __FUNCTION__, GetCurrentThreadId(), path);
+        ZeroMemory(data, sizeof(FILE_DATA));
+        return -1;
+    }
+    res = IoLoadFileData(data, wpath);
+    free(wpath);
+    return res;
 }
 
 /// @summary Open a file for memory-mapped I/O optimized for sequential reads.
