@@ -339,9 +339,9 @@ WorkerThreadMain
 /// @summary Enumerate all CPU resources of the host system.
 /// @param cpu_info The structure to populate with information about host CPU resources.
 /// @param arena The memory arena used to allocate temporary memory. The temporary memory is freed before the function returns.
-/// @return true if the host CPU information was successfully retrieved.
-public_function bool
-TpQueryHostLayout
+/// @return Zero if the host CPU information was successfully retrieved, or -1 if an error occurred.
+public_function int
+TpQueryHostCpuLayout
 (
     CPU_INFO  *cpu_info 
 )
@@ -379,7 +379,7 @@ TpQueryHostLayout
         cpu_info->PhysicalCores   = 1;
         cpu_info->HardwareThreads = 1;
         cpu_info->ThreadsPerCore  = 1;
-        return false;
+        return -1;
     }
     GetLogicalProcessorInformationEx(RelationAll, lpibuf, &buffer_size);
 
@@ -430,7 +430,7 @@ TpQueryHostLayout
 
     // calculate the total number of available hardware threads.
     cpu_info->HardwareThreads = (smt_count * cpu_info->ThreadsPerCore) + (cpu_info->PhysicalCores - smt_count);
-    return true;
+    return 0;
 }
 
 /// @summary Create a thread pool. The calling thread is blocked until all worker threads have successfully started and initialized.
