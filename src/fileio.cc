@@ -1,5 +1,7 @@
 /*/////////////////////////////////////////////////////////////////////////////
-/// @summary Decompress a JPEG file from memory into a memory buffer.
+/// @summary Implement various routines related to file I/O, including loading
+/// a file from disk all at once, using memory-mapped I/O to access portions 
+/// of a file, and enumerating all of the files in a directory.
 ///////////////////////////////////////////////////////////////////////////80*/
 
 /*//////////////////
@@ -12,6 +14,7 @@ struct FILE_INFO
     int64_t       FileSize;                   /// The size of the file, in bytes, at the time the directory enumeration was performed.
     FILETIME      LastWrite;                  /// The last write time of the file.
     DWORD         Attributes;                 /// The file attributes, as returned by GetFileAttributes().
+    uint32_t      SortKey;                    /// The sort key, reconstructed from the file extension.
 };
 
 /// @summary Define the container type for a list of files returned during directory enumeration.
@@ -165,6 +168,36 @@ AppendPathFragment
     return pathend;
 }
 
+/// @summary Extract a sort key from a filename. The filename is assumed to have a numeric component, such as FILENAME.###.
+/// @param filename Pointer to the start of a zero-terminated filename string.
+/// @return An integer sort key corresponding to the decimal integer equivalent of the numeric component of the file extension.
+internal_function uint32_t
+ExtractSortKey
+(
+    WCHAR const *filename
+)
+{
+    uint32_t     key = 0;
+    WCHAR const *ext = filename;
+    do
+    {   // search for the first occurrence of a '.' extension separator.
+        if (*ext == L'.')
+        {   // ext will point at the first character of the extension component.
+            ext++;
+            break;
+        }
+    } while (*ext++);
+
+    for ( ; ; )
+    {   // convert the first part of the extension to a decimal integer.
+        WCHAR ch = *ext++;
+        if ((ch <= L'0') || (ch >= L'9'))
+            break;
+        key = (key * 10) + (ch - L'0');
+    }
+    return key;
+}
+
 /// @summary Called recursively to enumerate all files in a directory and its subdirectories.
 /// @param files The list of files to populate.
 /// @param pathbuf Pointer to the start of a zero-terminated string specifying the absolute path of the directory to search.
@@ -243,9 +276,10 @@ EnumerateDirectoryFiles
         }
         CopyMemory(info.Path, pathbuf, (base_end - pathbuf) * sizeof(WCHAR));
         AppendPathFragment(info.Path + (base_end - pathbuf), fd.cFileName);
-        info.FileSize = (((int64_t) fd.nFileSizeHigh) << 32) | ((int64_t) fd.nFileSizeLow);
-        info.LastWrite = fd.ftLastWriteTime;
+        info.FileSize   = (((int64_t) fd.nFileSizeHigh) << 32) | ((int64_t) fd.nFileSizeLow);
+        info.LastWrite  = fd.ftLastWriteTime;
         info.Attributes = fd.dwFileAttributes;
+        info.SortKey    = ExtractSortKey(fd.cFileName);
         files.push_back(info);
     } while (FindNextFile(find, &fd));
     FindClose(find);
@@ -340,6 +374,20 @@ IoFreeFileList
         }
     }
     files.clear();
+}
+
+/// @summary Sort a FILE_LIST in ascending order by numeric sort key (derived from the file extension.)
+/// @param files The FILE_LIST to sort.
+public_function void
+IoSortFileList
+(
+    FILE_LIST &files
+)
+{
+    struct { bool operator()(FILE_INFO const &a, FILE_INFO const &b) const { 
+        return (a.SortKey < b.SortKey); 
+    } } KEYCMP;
+    std::sort(files.begin(), files.end(), KEYCMP);
 }
 
 /// @summary Load the entire contents of a file into memory.
