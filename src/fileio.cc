@@ -10,11 +10,11 @@
 /// @summary Define the data returned for each file during directory enumeration.
 struct FILE_INFO
 {
-    WCHAR        *Path;                       /// The absolute path of the file.
-    int64_t       FileSize;                   /// The size of the file, in bytes, at the time the directory enumeration was performed.
-    FILETIME      LastWrite;                  /// The last write time of the file.
-    DWORD         Attributes;                 /// The file attributes, as returned by GetFileAttributes().
-    uint32_t      SortKey;                    /// The sort key, reconstructed from the file extension.
+    WCHAR              *Path;                       /// The absolute path of the file.
+    int64_t             FileSize;                   /// The size of the file, in bytes, at the time the directory enumeration was performed.
+    FILETIME            LastWrite;                  /// The last write time of the file.
+    DWORD               Attributes;                 /// The file attributes, as returned by GetFileAttributes().
+    uint32_t            SortKey;                    /// The sort key, reconstructed from the file extension.
 };
 
 /// @summary Define the container type for a list of files returned during directory enumeration.
@@ -23,33 +23,170 @@ typedef std::vector<FILE_INFO> FILE_LIST;
 /// @summary Define the data maintained with a memory-mapped file opened for read access.
 struct FILE_MAPPING
 {
-    HANDLE        Filedes;                    /// A valid file handle, or INVALID_HANDLE_VALUE.
-    HANDLE        Filemap;                    /// A valid file mapping handle, or NULL.
-    int64_t       FileSize;                   /// The size of the file, in bytes, at the time it was opened.
-    size_t        Granularity;                /// The system allocation granularity, in bytes.
+    HANDLE              Filedes;                    /// A valid file handle, or INVALID_HANDLE_VALUE.
+    HANDLE              Filemap;                    /// A valid file mapping handle, or NULL.
+    int64_t             FileSize;                   /// The size of the file, in bytes, at the time it was opened.
+    size_t              Granularity;                /// The system allocation granularity, in bytes.
 };
 
 /// @summary Define the data associated with a region of a file loaded or mapped into memory.
 struct FILE_DATA
 {
-    uint8_t      *Buffer;                     /// The buffer containing the loaded file data.
-    void         *MapPtr;                     /// The address returned by MapViewOfFile.
-    int64_t       Offset;                     /// The offset of the data in this region from the start of the file, in bytes.
-    int64_t       DataSize;                   /// The number of bytes in Buffer that are valid.
-    uint32_t      Flags;                      /// One or more of FILE_DATA_FLAGS describing the allocation attributes of the FILE_DATA.
+    uint8_t            *Buffer;                     /// The buffer containing the loaded file data.
+    void               *MapPtr;                     /// The address returned by MapViewOfFile.
+    int64_t             Offset;                     /// The offset of the data in this region from the start of the file, in bytes.
+    int64_t             DataSize;                   /// The number of bytes in Buffer that are valid.
+    uint32_t            Flags;                      /// One or more of FILE_DATA_FLAGS describing the allocation attributes of the FILE_DATA.
+};
+
+/// @summary Define the data returned from an asynchronous I/O request.
+struct IO_RESULT
+{
+    int                 RequestType;                /// One of IO_REQUEST_TYPE specifying the type of operation that completed.
+    uint32_t            ResultCode;                 /// ERROR_SUCCESS or another result code indicating whether the operation completed successfully.
+    HANDLE              FileHandle;                 /// The handle of the file associated with the I/O request. This value may be INVALID_HANDLE_VALUE.
+    WCHAR              *PathBuffer;                 /// The path of the file associated with the I/O request. This value may be NULL.
+    void               *DataBuffer;                 /// The source or destination caller-managed buffer. This value may be NULL.
+    int64_t             DataAmount;                 /// The number of bytes read from or written to the data buffer.
+    int64_t             BaseOffset;                 /// The byte offset of the start of the operation from the start of the physical file.
+    int64_t             FileOffset;                 /// The byte offset of the start of the operation from the start of the logical file.
+};
+
+/// @summary Define the signature for the callback invoked when an asynchronous I/O operation has completed.
+/// @param result An IO_RESULT used to return data to the caller.
+/// @param was_successful Set to true if the operation completed successfully.
+typedef void (*IO_REQUEST_COMPLETE)(IO_RESULT result, bool was_successful);
+
+/// @summary Define the data associated with an asynchronous I/O request.
+struct IO_REQUEST
+{
+    int                 RequestType;                /// One of IO_REQUEST_TYPE specifying the type of operation to perform.
+    uint32_t            IoHintFlags;                /// One or more of IO_HINT_FLAGS, specifying hints that may be used to optimize the I/O operation.
+    HANDLE              FileHandle;                 /// The handle of the file associated with the READ, WRITE or FLUSH request.
+    WCHAR              *PathBuffer;                 /// Pointer to a caller-managed buffer specifying the path of the file to OPEN, LOAD or SAVE.
+    void               *DataBuffer;                 /// The caller-managed buffer from which to READ/LOAD or WRITE/SAVE data, or NULL for NOOP, OPEN and FLUSH requests.
+    int64_t             DataAmount;                 /// The number of bytes to transfer to or from the caller-managed data buffer.
+    int64_t             BaseOffset;                 /// The byte offset of the start of the operation from the start of the physical file.
+    int64_t             FileOffset;                 /// The byte offset of the start of the operation from the start of the logical file.
+    IO_REQUEST_COMPLETE IoComplete;                 /// The callback to invoke when the operation has completed.
+};
+
+/// @summary Define the data associated with a list of asynchronous I/O requests. All requests in a list have the same type. Used internally as part of ASYNC_IO_STATE.
+struct IO_REQUEST_LIST
+{
+    size_t              Count;                      /// The number of requests in the list.
+    IO_REQUEST         *Requests;                   /// A fixed-length array of request data, of which Count items are valid.
+};
+
+/// @summary Define the data associated with an I/O request queue. The I/O request queue is used to capture asynchronous I/O requests from the application.
+struct IO_REQUEST_QUEUE
+{
+    size_t              Count;                      /// The number of items in the active write buffer.
+    size_t              Capacity;                   /// The maximum capacity of the active write buffer.
+    HANDLE              CompletionPort;             /// The I/O completion port to signal when a request is written to the queue.
+    size_t              WriteBuffer;                /// The zero-based index of the current write buffer (either 0 or 1).
+    IO_REQUEST         *ContiguousBuffer;           /// The contiguous I/O request buffer from which all other buffers are sub-allocated.
+    IO_REQUEST         *RequestBuffers[2];          /// Two buffers, each with allocated capacity Capacity requests. One buffer is used for reading by the I/O thread, and the other is used for writing by application threads.
+    CRITICAL_SECTION    QueueWriteLock;             /// The critical section used to synchronize access to the write buffer.
+    char                Padding[32];                /// Pad queue data out to a cacheline boundary.
+
+    IO_REQUEST_LIST     OpenRequests;               /// The list of all unprocessed OPEN requests received on this tick.
+    IO_REQUEST_LIST     ReadRequests;               /// The list of all unprocessed READ requests received on this tick.
+    IO_REQUEST_LIST     WriteRequests;              /// The list of all unprocessed WRITE requests received on this tick.
+    IO_REQUEST_LIST     FlushRequests;              /// The list of all unprocessed FLUSH requests received on this tick.
+    IO_REQUEST_LIST     CloseRequests;              /// The list of all unprocessed CLOSE requests received on this tick.
+    IO_REQUEST_LIST     LoadRequests;               /// The list of all unprocessed LOAD requests received on this tick.
+    IO_REQUEST_LIST     SaveRequests;               /// The list of all unprocessed SAVE requests received on this tick.
+};
+
+/// @summary Define the data associated with active asynchronous I/O operations.
+struct IO_ASYNC_STATE
+{
+    size_t              Count;                      /// The number of in-flight (uncompleted) asynchronous I/O requests.
+    size_t              Capacity;                   /// The maximum number of asynchronous I/O requests that can be in-flight at any one time.
+    HANDLE              CompletionPort;             /// The I/O completion port used to receive asynchronous I/O completion notifications.
+    OVERLAPPED         *OverlappedPool;             /// The buffer of OVERLAPPED instances used for submitting asynchronous I/O requests.
+    OVERLAPPED        **OverlappedFree;             /// The array of pointers to OVERLAPPED instances (in the pool) available for use.
+    IO_REQUEST         *InFlightRequests;           /// The array of IO_REQUEST for in-flight asynchronous requests, of which Count are valid.
+    OVERLAPPED        **InFlightOverlapped;         /// The array of OVERLAPPED pointers for in-flight asynchronous requests, of which Count are valid.
+    OVERLAPPED_ENTRY   *EventBuffer;                /// The array of OVERLAPPED_ENTRY values representing events posted to the I/O completion port.
+};
+
+struct IO_BACKGROUND_THREAD_ARGS
+{
+    IO_ASYNC_STATE     *AIOState;                   /// The asynchronous I/O state data used to track in-flight asynchronous I/O requests submitted to the kernel.
+    IO_REQUEST_QUEUE   *AIOQueue;                   /// The I/O request queue used to submit requests to the I/O thread.
+};
+
+struct IO_BACKGROUND_THREAD
+{
+    HANDLE              ThreadHandle;               /// 
+    unsigned int        ThreadId;                   /// 
+    uint32_t            DefaultHints_Open;          /// 
+    uint32_t            DefaultHints_Load;          /// 
+    uint32_t            DefaultHints_Save;          /// 
+    IO_ASYNC_STATE      AIOState;                   /// 
+    IO_REQUEST_QUEUE    AIOQueue;                   /// 
+};
+
+struct IO_BACKGROUND_THREAD_INIT
+{
+    size_t              MaxRequestsQueued;          /// 
+    size_t              MaxRequestsInFlight;        /// 
+    uint32_t            DefaultHints_Open;          /// 
+    uint32_t            DefaultHints_Load;          /// 
+    uint32_t            DefaultHints_Save;          /// 
+};
+
+/// @summary Define the supported types of asynchronous I/O requests.
+enum IO_REQUEST_TYPE : int
+{
+    IO_REQUEST_NOOP              =  0,              /// Ignore the operation.
+    IO_REQUEST_OPEN_FILE         =  1,              /// Asynchronously open a file, but do not issue any other I/O operations.
+    IO_REQUEST_READ_FILE         =  2,              /// Issue an explicit asynchronous read request.
+    IO_REQUEST_WRITE_FILE        =  3,              /// Issue an explicit asynchronous write request.
+    IO_REQUEST_FLUSH_FILE        =  4,              /// Issue an explicit asynchronous flush request.
+    IO_REQUEST_CLOSE_FILE        =  5,              /// Asynchronously close a file.
+    IO_REQUEST_LOAD_FILE         =  6,              /// Asynchronously open a file, read its entire contents into a caller-managed buffer, and close the file.
+    IO_REQUEST_SAVE_FILE         =  7,              /// Asynchronously open a file, write the contents of a caller-managed buffer to the file, and close the file.
+};
+
+/// @summary Define a name for the default number of threads that can submit asynchronous I/O requests.
+enum IO_SUBMIT_THREAD_COUNT : size_t
+{
+    IO_SUBMIT_THREAD_COUNT_DEFAULT = 0,             /// Asynchronous I/O operations may be submitted from as many threads as there are logical processors in the system.
+};
+
+/// @summary Define flags used to optimize asynchronous I/O operations.
+enum IO_HINT_FLAGS : uint32_t
+{
+    IO_HINT_FLAGS_NONE           = (0 << 0),        /// No I/O hints are specified, use the default behavior appropriate for the I/O request type.
+    IO_HINT_FLAG_SEQUENTIAL      = (1 << 0),        /// Optimize for sequential access when performing cached/buffered I/O (valid for OPEN, LOAD and SAVE.)
+    IO_HINT_FLAG_UNCACHED        = (1 << 1),        /// Indicate that the I/O should bypass the OS page cache, and that the source or destination buffer meets sector alignment requirements (valid for OPEN, LOAD and SAVE).
 };
 
 /// @summary Define various allocation attributes of a file region.
 enum FILE_DATA_FLAGS : uint32_t
 {
-    FILE_DATA_FLAGS_NONE         = (0 << 0),  /// The FILE_DATA is invalid.
-    FILE_DATA_FLAG_COMMITTED     = (1 << 0),  /// The FILE_DATA buffer is an explicitly allocated region of memory.
-    FILE_DATA_FLAG_MAPPED_REGION = (1 << 1),  /// The FILE_DATA represents a mapped region of a file.
+    FILE_DATA_FLAGS_NONE         = (0 << 0),        /// The FILE_DATA is invalid.
+    FILE_DATA_FLAG_COMMITTED     = (1 << 0),        /// The FILE_DATA buffer is an explicitly allocated region of memory.
+    FILE_DATA_FLAG_MAPPED_REGION = (1 << 1),        /// The FILE_DATA represents a mapped region of a file.
 };
 
 /*///////////////
 //   Globals   //
 ///////////////*/
+/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to AIO_COMPLETION_KEY_WAKEUP0 to indicate that one or more requests are waiting in request buffer 0.
+global_variable ULONG_PTR const AIO_COMPLETION_KEY_WAKEUP0  = 0;
+
+/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to AIO_COMPLETION_KEY_WAKEUP1 to indicate that one or more requests are waiting in request buffer 1.
+global_variable ULONG_PTR const AIO_COMPLETION_KEY_WAKEUP1  = 1;
+
+/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to AIO_COMPLETION_KEY_SHUTDOWN to terminate the asynchronous I/O thread loop.
+global_variable ULONG_PTR const AIO_COMPLETION_KEY_SHUTDOWN = 2;
+
+/// @summary OVERLAPPED_ENTRY::lpCompletionKey that is guaranteed to be an 'invalid' completion key.
+global_variable ULONG_PTR const AIO_COMPLETION_KEY_UNUSED   =~ULONG_PTR(0);
 
 /*//////////////////////////
 //   Internal Functions   //
@@ -284,6 +421,360 @@ EnumerateDirectoryFiles
     } while (FindNextFile(find, &fd));
     FindClose(find);
     return 0;
+}
+
+/// @summary Complete an asynchronous I/O request.
+/// @param request The request being completed.
+/// @param file_handle The handle of the file associated with the request.
+/// @param bytes_transferred The number of bytes transferred to or from the request data buffer.
+/// @param result_code ERROR_SUCCESS or another operating system result code indicating the result of the operation.
+/// @param was_successful true if the I/O request completed successfully.
+internal_function void
+CompleteIoRequest
+(
+    IO_REQUEST const *request, 
+    HANDLE        file_handle,
+    int64_t bytes_transferred, 
+    uint32_t      result_code, 
+    bool       was_successful
+)
+{
+    if (request->IoComplete != NULL)
+    {
+        IO_RESULT  res;
+        res.RequestType = request->RequestType;
+        res.ResultCode  = result_code;
+        res.FileHandle  = file_handle;
+        res.PathBuffer  = request->PathBuffer;
+        res.DataBuffer  = request->DataBuffer;
+        res.DataAmount  = bytes_transferred;
+        res.BaseOffset  = request->BaseOffset;
+        res.FileOffset  = request->FileOffset;
+        request->IoComplete(res, was_successful);
+    }
+}
+
+/// @summary Complete a no-op or pass-through I/O request.
+/// @param request The request being completed.
+internal_function inline void
+CompleteIoRequest_Noop
+(
+    IO_REQUEST const *request
+)
+{
+    CompleteIoRequest(request, INVALID_HANDLE_VALUE, 0, ERROR_SUCCESS, true);
+}
+
+/// @summary Complete a failed asynchronous I/O request.
+/// @param request The request being completed.
+/// @param file_handle The handle of the file associated with the request.
+/// @param result_code ERROR_SUCCESS or another operating system result code indicating the result of the operation.
+internal_function inline void
+CompleteIoRequest_Error
+(
+    IO_REQUEST const *request, 
+    HANDLE        file_handle,
+    uint32_t      result_code
+)
+{
+    CompleteIoRequest(request, file_handle, 0, result_code, false);
+}
+
+/// @summary Initialize an I/O request list using externally-allocated storage.
+/// @param list The IO_REQUEST_LIST to initialize.
+/// @param storage The externally-allocated storage for the request list.
+internal_function void
+InitIoRequestList
+(
+    IO_REQUEST_LIST *list, 
+    IO_REQUEST   *storage
+)
+{   assert(storage != NULL);
+    list->Count     = 0;
+    list->Requests  = storage;
+}
+
+/// @summary Append an I/O request whose type matches the list type.
+/// @param list The I/O request list to receive the request.
+/// @param request The request to append.
+internal_function inline void
+AppendIoRequest
+(
+    IO_REQUEST_LIST     *list, 
+    IO_REQUEST const &request
+)
+{   // no assert here; list is allocated to maximum capacity.
+    list->Requests[list->Count++] = request;
+}
+
+/// @summary Reset the number of items in an I/O request list.
+internal_function inline void
+ClearIoRequestList
+(
+    IO_REQUEST_LIST *list
+)
+{
+    list->Count = 0;
+}
+
+/// @summary Allocate and initialize an I/O request queue. The queue is safe for concurrent access by multiple writers and a single reader.
+/// @param ioq The IO_REQUEST_QUEUE to initialize.
+/// @param max_requests The maximum number of queued requests.
+/// @param completion_port The I/O completion port to signal when one or more requests are available in the write queue.
+/// @param spin_count The spin count to use for the queue writer critical section.
+/// @return Zero if the request queue is successfully initialized, or -1 if an error occurred.
+internal_function int
+CreateIoRequestQueue
+(
+    IO_REQUEST_QUEUE  *ioq, 
+    size_t    max_requests,
+    HANDLE completion_port, 
+    uint32_t    spin_count=4096
+)
+{
+    size_t const        IOBUFS_COUNT =  9;   // Read buffer, write buffer, one per IO_REQUEST_TYPE (excluding NOOP).
+    IO_REQUEST *contiguous_io_buffer = NULL; // one big allocation for I/O requests.
+    size_t            io_buffer_size = IOBUFS_COUNT * max_requests * sizeof(IO_REQUEST);
+
+    // initialize the fields of the IO_REQUEST_QUEUE structure.
+    ZeroMemory(ioq, sizeof(IO_REQUEST_QUEUE));
+
+    // allocate a large buffer for I/O requests. this buffer will be split into 
+    // IOBUFS_COUNT equally-sized pieces for various uses and simplifies cleanup code.
+    if ((contiguous_io_buffer = (IO_REQUEST*) malloc(io_buffer_size)) == NULL)
+    {
+        ConsoleError("ERROR: %S(%u): Failed to allocate %Iu bytes for I/O request data.\n", __FUNCTION__, GetCurrentThreadId(), io_buffer_size);
+        return -1;
+    }
+
+    // initialize the fields of the request queue structure now that all storage is allocated.
+    ioq->Count             = 0;
+    ioq->Capacity          = max_requests;
+    ioq->CompletionPort    = completion_port;
+    ioq->WriteBuffer       = 0;
+    ioq->ContiguousBuffer  = contiguous_io_buffer;
+    ioq->RequestBuffers[0] =&contiguous_io_buffer[max_requests * 0];
+    ioq->RequestBuffers[1] =&contiguous_io_buffer[max_requests * 1];
+    InitializeCriticalSectionAndSpinCount(&ioq->QueueWriteLock , spin_count);
+    InitIoRequestList(&ioq->OpenRequests , &contiguous_io_buffer[max_requests * 2]);
+    InitIoRequestList(&ioq->ReadRequests , &contiguous_io_buffer[max_requests * 3]);
+    InitIoRequestList(&ioq->WriteRequests, &contiguous_io_buffer[max_requests * 4]);
+    InitIoRequestList(&ioq->FlushRequests, &contiguous_io_buffer[max_requests * 5]);
+    InitIoRequestList(&ioq->CloseRequests, &contiguous_io_buffer[max_requests * 6]);
+    InitIoRequestList(&ioq->LoadRequests , &contiguous_io_buffer[max_requests * 7]);
+    InitIoRequestList(&ioq->SaveRequests , &contiguous_io_buffer[max_requests * 8]);
+    return 0;
+}
+
+/// @summary Attempt to enqueue a single I/O request to the asynchronous I/O thread.
+/// @param ioq The IO_REQUEST_QUEUE to which the request will be posted.
+/// @param req The I/O request to submit.
+/// @return The number of I/O requests posted to the queue. This value is zero if the queue is full.
+internal_function size_t
+EnqueueIoRequest
+(
+    IO_REQUEST_QUEUE *ioq, 
+    IO_REQUEST const &req
+)
+{
+    ULONG_PTR completion_key = 0;
+    size_t    enqueue_count  = 0;
+    EnterCriticalSection(&ioq->QueueWriteLock);
+    {
+        if (ioq->Count < ioq->Capacity)
+        {   // there's sufficient space in the buffer; enqueue the item.
+            ioq->RequestBuffers[ioq->WriteBuffer][ioq->Count++] = req;
+            completion_key = AIO_COMPLETION_KEY_WAKEUP0 + ioq->WriteBuffer;
+            enqueue_count  = 1;
+        }
+    }
+    LeaveCriticalSection(&ioq->QueueWriteLock);
+    
+    if (enqueue_count > 0)
+    {   // notify any waiter that at least one request is available.
+        if (!PostQueuedCompletionStatus(ioq->CompletionPort, 0, completion_key, NULL))
+        {   // this isn't a fatal error - hopefully a subsequent notification will succeed.
+            ConsoleError("ERROR: %S(%u): Failed to notify async I/O thread about waiting request (%08X).\n", __FUNCTION__, GetCurrentThreadId(), GetLastError());
+        }
+    }
+    return enqueue_count;
+}
+
+/// @summary Attempt to enqueue one or more I/O requests to the asynchronous I/O thread.
+/// @param ioq The IO_REQUEST_QUEUE to which the request will be posted.
+/// @param request_list The I/O request(s) to submit.
+/// @param request_count The number of I/O request(s) to submit.
+/// @return The number of I/O requests posted to the queue. This value is zero if the queue is full.
+internal_function size_t
+EnqueueIoRequest
+(
+    IO_REQUEST_QUEUE          *ioq, 
+    IO_REQUEST const *request_list, 
+    size_t     const  request_count
+)
+{
+    ULONG_PTR completion_key = 0;
+    size_t     enqueue_avail = 0;
+    size_t     enqueue_count = 0;
+    EnterCriticalSection(&ioq->QueueWriteLock);
+    {   // figure out how many items can be enqueued and copy them into the write buffer.
+        enqueue_avail  = ioq->Capacity -  ioq->Count;
+        enqueue_count  = request_count <= enqueue_avail ? request_count : enqueue_avail;
+        completion_key = AIO_COMPLETION_KEY_WAKEUP0 + ioq->WriteBuffer;
+        CopyMemory(&ioq->RequestBuffers[ioq->WriteBuffer][ioq->Count], request_list, enqueue_count * sizeof(IO_REQUEST));
+        ioq->Count    += enqueue_count;
+    }
+    LeaveCriticalSection(&ioq->QueueWriteLock);
+
+    if (enqueue_count > 0)
+    {   // notify any waiter that at least one request is available.
+        if (!PostQueuedCompletionStatus(ioq->CompletionPort, 0, completion_key, NULL))
+        {   // this isn't a fatal error - hopefully a subsequent notification will succeed.
+            ConsoleError("ERROR: %S(%u): Failed to notify async I/O thread about waiting request(s) (%08X).\n", __FUNCTION__, GetCurrentThreadId(), GetLastError());
+        }
+    }
+    return enqueue_count;
+}
+
+/// @summary Retrieve waiting I/O requests and swap the read and write buffers. This function should be called from the I/O thread only.
+/// @param ioq The IO_REQUEST_QUEUE to poll.
+/// @return The total number of I/O requests retrieved.
+internal_function size_t
+RetrieveWaitingIoRequests
+(
+    IO_REQUEST_QUEUE *ioq
+)
+{
+    IO_REQUEST    *rdbuf = NULL;
+    size_t   read_buffer = 0;
+    size_t waiting_count = 0;
+    EnterCriticalSection(&ioq->QueueWriteLock);
+    {   // retrieve the number of waiting items, and swap buffers.
+        rdbuf = ioq->RequestBuffers[ioq->WriteBuffer];
+        ioq->WriteBuffer = 1 - ioq->WriteBuffer;
+        waiting_count = ioq->Count;
+        ioq->Count = 0;
+    }
+    LeaveCriticalSection(&ioq->QueueWriteLock);
+
+    // clear out the request lists from the previous tick.
+    ClearIoRequestList(&ioq->OpenRequests);
+    ClearIoRequestList(&ioq->ReadRequests);
+    ClearIoRequestList(&ioq->WriteRequests);
+    ClearIoRequestList(&ioq->FlushRequests);
+    ClearIoRequestList(&ioq->CloseRequests);
+    ClearIoRequestList(&ioq->LoadRequests);
+    ClearIoRequestList(&ioq->SaveRequests);
+
+    // sort the just-retrieved requests into different lists by request type.
+    for (size_t i = 0; i < waiting_count; ++i)
+    {
+        switch (rdbuf[i].RequestType)
+        {
+            case IO_REQUEST_NOOP: 
+                { CompleteIoRequest_Noop(&rdbuf[i]);
+                } break;
+            case IO_REQUEST_OPEN_FILE:
+                { AppendIoRequest(&ioq->OpenRequests , rdbuf[i]);
+                } break;
+            case IO_REQUEST_READ_FILE:
+                { AppendIoRequest(&ioq->ReadRequests , rdbuf[i]);
+                } break;
+            case IO_REQUEST_WRITE_FILE:
+                { AppendIoRequest(&ioq->WriteRequests, rdbuf[i]);
+                } break;
+            case IO_REQUEST_FLUSH_FILE:
+                { AppendIoRequest(&ioq->FlushRequests, rdbuf[i]);
+                } break;
+            case IO_REQUEST_CLOSE_FILE:
+                { AppendIoRequest(&ioq->CloseRequests, rdbuf[i]);
+                } break;
+            case IO_REQUEST_LOAD_FILE:
+                { AppendIoRequest(&ioq->LoadRequests , rdbuf[i]);
+                } break;
+            case IO_REQUEST_SAVE_FILE:
+                { AppendIoRequest(&ioq->SaveRequests , rdbuf[i]);
+                } break;
+            default:
+                { CompleteIoRequest_Noop(&rdbuf[i]);
+                } break;
+        }
+    }
+    return waiting_count;
+}
+
+/// @summary Initialize an IO_ASYNC_STATE object.
+/// @param aio The IO_ASYNC_STATE object to initialize.
+/// @param max_requests The maximum number of requests that may be submitted to the kernel, but uncompleted, at any given time.
+/// @param submit_threads The maximum number of threads that can submit asynchronous I/O requests concurrently.
+/// @return Zero if the object is successfully initialized, or -1 if an error occurred.
+internal_function int
+CreateIoAsyncState
+(
+    IO_ASYNC_STATE   *aio, 
+    size_t   max_requests, 
+    size_t submit_threads=IO_SUBMIT_THREAD_COUNT_DEFAULT
+)
+{
+    OVERLAPPED       *ovpool = NULL;
+    OVERLAPPED      **ovfree = NULL;
+    OVERLAPPED      **ovused = NULL;
+    OVERLAPPED_ENTRY *evtbuf = NULL;
+    IO_REQUEST       *reqbuf = NULL;
+    HANDLE              iocp = NULL;
+
+    // initialize the fields of the IO_ASYNC_STATE structure.
+    ZeroMemory(aio, sizeof(IO_ASYNC_STATE));
+
+    // create an I/O completion port used to receive asynchronous I/O completion notifications 
+    // and signals when I/O requests are posted to the associated IO_REQUEST_QUEUE.
+    if ((iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, AIO_COMPLETION_KEY_UNUSED, (DWORD) submit_threads)) == NULL)
+    {
+        ConsoleError("ERROR: %S(%u): Unable to create asynchronous I/O completion port (%08X).\n", __FUNCTION__, GetCurrentThreadId(), GetLastError());
+        goto cleanup_and_fail;
+    }
+
+    // allocate several buffers used for tracking various data associated with in-flight I/O requests.
+    ovfree = (OVERLAPPED     **) malloc(max_requests * sizeof(OVERLAPPED*));
+    ovused = (OVERLAPPED     **) malloc(max_requests * sizeof(OVERLAPPED*));
+    reqbuf = (IO_REQUEST      *) malloc(max_requests * sizeof(IO_REQUEST));
+    ovpool = (OVERLAPPED      *) malloc(max_requests * sizeof(OVERLAPPED));
+    evtbuf = (OVERLAPPED_ENTRY*) malloc(max_requests * sizeof(OVERLAPPED_ENTRY));
+    if (ovfree == NULL || ovused == NULL || reqbuf == NULL || ovpool == NULL || evtbuf == NULL)
+    {
+        ConsoleError("ERROR: %S(%u): Unable to allocate memory for asynchronous I/O buffers. Consider reducing max_requests (%Iu).\n", __FUNCTION__, GetCurrentThreadId(), max_requests);
+        goto cleanup_and_fail;
+    }
+    ZeroMemory(ovused, max_requests * sizeof(OVERLAPPED*));
+    ZeroMemory(ovpool, max_requests * sizeof(OVERLAPPED));
+    ZeroMemory(reqbuf, max_requests * sizeof(IO_REQUEST));
+    ZeroMemory(evtbuf, max_requests * sizeof(OVERLAPPED_ENTRY));
+
+    // add all of the OVERLAPPED objects to the free list.
+    for (size_t i = 0; i < max_requests; ++i)
+    {
+        ovfree[i] = &ovpool[i];
+    }
+
+    // initialize the fields of the IO_ASYNC_STATE structure.
+    aio->Count              = 0;
+    aio->Capacity           = max_requests;
+    aio->CompletionPort     = iocp;
+    aio->OverlappedPool     = ovpool;
+    aio->OverlappedFree     = ovfree;
+    aio->InFlightRequests   = reqbuf;
+    aio->InFlightOverlapped = ovused;
+    aio->EventBuffer        = evtbuf;
+    return 0;
+
+cleanup_and_fail:
+    if (evtbuf != NULL) free(evtbuf);
+    if (ovpool != NULL) free(ovpool);
+    if (reqbuf != NULL) free(reqbuf);
+    if (ovused != NULL) free(ovused);
+    if (ovfree != NULL) free(ovfree);
+    if (iocp   != NULL) CloseHandle(iocp);
+    return -1;
 }
 
 /*////////////////////////
@@ -632,5 +1123,93 @@ IoFreeFileData
         // ...
     }
     ZeroMemory(data, sizeof(FILE_DATA));
+}
+
+public_function unsigned int __cdecl
+IoBackgroundThreadMain
+(
+    void *argp
+)
+{
+    IO_BACKGROUND_THREAD_ARGS args = {};
+    IO_REQUEST_QUEUE          *ioq = NULL;
+    IO_ASYNC_STATE            *aio = NULL;
+    ULONG_PTR       request_buffer = AIO_COMPLETION_KEY_UNUSED;
+    DWORD                thread_id = GetCurrentThreadId();
+    DWORD               max_events = 0;
+
+    // copy argument data into a thread-local instance.
+    CopyMemory(&args, argp, sizeof(IO_BACKGROUND_THREAD_ARGS));
+    max_events = (DWORD) args.AIOState->Capacity;
+    aio = args.AIOState; ioq = args.AIOQueue;
+
+    for ( ; ; )
+    {   // wait until events are available on the completion port, indicating:
+        // 1. one or more I/O requests have been completed by the kernel
+        // 2. one or more I/O requests have been submitted by the application
+        // 3. the application has requested the thread to shut down
+        ULONG num_events = 0; // the number of completion port events returned
+        if (!GetQueuedCompletionStatusEx(aio->CompletionPort, aio->EventBuffer, max_events, &num_events, INFINITE, FALSE))
+        {
+            ConsoleError("ERROR: %S(%u): Background I/O thread failed waiting on completion port (%08X).\n", __FUNCTION__, GetCurrentThreadId(), GetLastError());
+            goto terminate_thread;
+        }
+        // process the received events and complete active requests.
+        for (ULONG evi = 0;  evi < num_events; ++evi)
+        {
+            OVERLAPPED_ENTRY evt = aio->EventBuffer[evi];
+            OVERLAPPED      *ovr = evt.lpOverlapped;
+
+            if (evt.lpOverlapped != NULL)
+            {   // this is a completed I/O request. lookup by OVERLAPPED in the unordered active list.
+                OVERLAPPED **ios = aio->InFlightOverlapped;
+                size_t const   n = aio->Count;
+                for (size_t io = 0; io < n; ++io)
+                {   // this search consists of simple pointer comparisons.
+                    if (ovr == ios[io])
+                    {
+                        DWORD   err = HRESULT_FROM_NT(evt.Internal);
+                        int64_t amt = evt.dwNumberOfBytesTransferred;
+                        // TODO(rlk): we need an additional array of HANDLE.
+                        // CompleteIoRequest(&aio->InFlightRequests[io], aio->InFlightHandles[io], ...);
+                        // return the OVERLAPPED to the free list, and remove this item from the in-flight list.
+                        aio->OverlappedFree[aio->Capacity-n] = ovr;
+                        aio->InFlightHandles   [io] = aio->InFlightHandles[n-1];
+                        aio->InFlightRequests  [io] = aio->InFlightRequests[n-1];
+                        aio->InFlightOverlapped[io] = aio->InFlightOverlapped[n-1];
+                        aio->Count--;
+                        break;
+                    }
+                }
+            }
+            else
+            {   // this is some kind of thread notification.
+                switch (evt.lpCompletionKey)
+                {
+                    case AIO_COMPLETION_KEY_WAKEUP0:
+                    case AIO_COMPLETION_KEY_WAKEUP1:
+                        { // if the completion key doesn't match the current request_buffer, swap.
+                          // this can happen at most once per-iteration of the outermost loop.
+                          // if the completion key matches the current request buffer, ignore the event.
+                          if (evt.lpCompletionKey != request_buffer)
+                          {   
+                              RetrieveWaitingRequests(args.AIOQueue);
+                              request_buffer = evt.lpCompletionKey;
+                          }
+                        } break;
+                    case AIO_COMPLETION_KEY_SHUTDOWN:
+                        { ConsoleOutput("DEATH: %S(%u): Background I/O thread received shutdown signal.\n", __FUNCTION__, GetCurrentThreadId());
+                        } goto terminate_thread;
+                    default:
+                        { ConsoleError("ERROR: %S(%u): Background I/O thread received unknown signal %p.\n", __FUNCTION__, GetCurrentThreadId(), evt.lpCompletionKey);
+                        } break;
+                }
+            }
+        }
+        // finished processing received events; process incoming requests.
+    }
+
+terminate_thread:
+    return 0;
 }
 
