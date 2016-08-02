@@ -603,6 +603,22 @@ CreateIoRequestQueue
     return 0;
 }
 
+/// @summary Free resources associated with an I/O request queue.
+/// @param ioq The IO_REQUEST_QUEUE to delete.
+internal_function void
+DeleteIoRequestQueue
+(
+    IO_REQUEST_QUEUE *ioq
+)
+{
+    if (ioq->ContiguousBuffer != NULL)
+    {
+        free(ioq->ContiguousBuffer);
+        DeleteCriticalSection(&ioq->QueueWriteLock);
+    }
+    ZeroMemory(ioq, sizeof(IO_REQUEST_QUEUE));
+}
+
 /// @summary Attempt to enqueue a single I/O request to the asynchronous I/O thread.
 /// @param ioq The IO_REQUEST_QUEUE to which the request will be posted.
 /// @param req The I/O request to submit.
@@ -734,6 +750,21 @@ CreateIoRequestList
     return 0;
 }
 
+/// @summary Free resources associated with an I/O request list.
+/// @param request_list The IO_REQUEST_LIST to delete.
+internal_function void
+DeleteIoRequestList
+(
+    IO_REQUEST_LIST *request_list
+)
+{
+    if (request_list->NodePool != NULL)
+    {
+        free(request_list->NodePool);
+    }
+    ZeroMemory(request_list, sizeof(IO_REQUEST_LIST));
+}
+
 /// @summary Allocate and initialize a slot for an asynchronous I/O request. This should not be called for requests that do not have an asynchronous component.
 /// @param io The application I/O request parameters.
 /// @param request_list The I/O request list used to track active requests.
@@ -861,7 +892,7 @@ CreateIoAsyncState
     return 0;
 
 cleanup_and_fail:
-    // TODO(rlk): clean up actreq.
+    DeleteIoRequestList(&actreq);
     if (evtbuf != NULL) free(evtbuf);
     if (iocp   != NULL) CloseHandle(iocp);
     return -1;
