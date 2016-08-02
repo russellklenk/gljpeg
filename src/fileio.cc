@@ -39,7 +39,31 @@ struct FILE_DATA
     uint32_t            Flags;                      /// One or more of FILE_DATA_FLAGS describing the allocation attributes of the FILE_DATA.
 };
 
-/// @summary Define the data returned from an asynchronous I/O request.
+/// @summary Define the data used to execute a low-level I/O operation. Not all data is used by all operations.
+struct IO_OPERATION
+{
+    WCHAR              *FilePath;                   /// Pointer to a zero-terminated string specifying the file path. Used for OPEN operations only.
+    HANDLE              FileHandle;                 /// The file handle specifying the target for the operation. Used for READ, WRITE, FLUSH and CLOSE operations.
+    HANDLE              CompletionPort;             /// The I/O completion port to associate with the file, or NULL. Used for OPEN operations only.
+    OVERLAPPED         *Overlapped;                 /// The OVERLAPPED object to use for asynchronous I/O, or NULL to use synchronous I/O. Used for READ and WRITE operations.
+    void               *DataBuffer;                 /// The source buffer specifying data to write, or destination buffer for data being read. Used for READ and WRITE operations.
+    int64_t             FileOffset;                 /// The absolute byte offset within the file at which to perform the I/O operation. Used for asynchronous READ and WRITE only.
+    int64_t             PreallocationSize;          /// The desired size of the file, if IO_HINT_FLAG_PREALLOCATE is specified. Used for OPEN operations only.
+    uint32_t            TransferAmount;             /// The number of bytes to transfer. Used for READ and WRITE operations.
+    uint32_t            IoHintFlags;                /// One or more of IO_HINT_FLAGS. Used for OPEN operations only.
+};
+
+/// @summary Define the data resulting from the execution of a low-level I/O operation.
+struct IO_OPERATION_RESULT
+{
+    HANDLE              FileHandle;                 /// The file handle specifying the target for the operaiton. For OPEN operations, this is the handle of the opened file.
+    DWORD               ResultCode;                 /// The operating system result code.
+    uint32_t            TransferAmount;             /// The number of bytes transferred.
+    bool                CompletedSynchronously;     /// Set to true if the I/O operation completed synchronously, or false if the I/O operation completed asynchronously.
+    bool                WasSuccessful;              /// Set to true if the I/O operation completed successfully, or false if the I/O operation failed.
+};
+
+/// @summary Define the data returned from a background I/O request submitted by the application.
 struct IO_RESULT
 {
     int                 RequestType;                /// One of IO_REQUEST_TYPE specifying the type of operation that completed.
@@ -48,18 +72,28 @@ struct IO_RESULT
     HANDLE              FileHandle;                 /// The handle of the file associated with the I/O request. This value may be INVALID_HANDLE_VALUE.
     WCHAR              *PathBuffer;                 /// The path of the file associated with the I/O request. This value may be NULL.
     void               *DataBuffer;                 /// The source or destination caller-managed buffer. This value may be NULL.
-    int64_t             DataAmount;                 /// The number of bytes read from or written to the data buffer.
-    int64_t             BaseOffset;                 /// The byte offset of the start of the operation from the start of the physical file.
+    union
+    {
+        int64_t         FileSize;                   /// For an OPEN operation, the file size is returned in this field.
+        int64_t         DataAmount;                 /// The number of bytes read from or written to the data buffer.
+    };
+    union
+    {
+        int64_t         BaseOffset;                 /// The byte offset of the start of the operation from the start of the physical file.
+        int64_t         PhysicalSectorSize;         /// For an OPEN operation, the physical device sector size in bytes is returned in this field.
+    };
     int64_t             FileOffset;                 /// The byte offset of the start of the operation from the start of the logical file.
 };
 
-/// @summary Define the signature for the callback invoked when an asynchronous I/O operation has completed.
+/// @summary Define the signature for the callback invoked when a background I/O operation has completed.
 /// @param result An IO_RESULT used to return data to the caller.
+/// @param queue_delay The number of nanoseconds elapsed between the application submitting the request and the background I/O thread executing the request.
+/// @param execution_time The number of nanoseconds elapsed between the background I/O thread executing the request and the request completing.
 /// @param was_successful Set to true if the operation completed successfully.
-typedef void (*IO_REQUEST_COMPLETE)(IO_RESULT result, bool was_successful);
+typedef void (*IO_REQUEST_COMPLETE)(IO_RESULT result, uint64_t queue_delay, uint64_t execution_time, bool was_successful);
 
-/// @summary Define the data associated with an asynchronous I/O request, as submitted by the application.
-/// The background I/O system uses a different format to represent the data.
+/// @summary Define the data associated with a background I/O request submitted by the application.
+/// The background I/O system uses a different format to represent the data internally.
 struct IO_REQUEST
 {
     int                 RequestType;                /// One of IO_REQUEST_TYPE specifying the type of operation to perform.
@@ -75,14 +109,14 @@ struct IO_REQUEST
     IO_REQUEST_COMPLETE IoComplete;                 /// The callback to invoke when the operation has completed.
 };
 
-/// @summary Define the data representing an active request within the background I/O system.
+/// @summary Define the data representing an active request internally within the background I/O system.
 /// The IO_REQUEST_NODE is also associated with the file handle, and passed back as the completion key.
 struct IO_REQUEST_NODE
 {
     IO_REQUEST_NODE    *NextRequest;                /// Pointer to the next node in the list, or NULL if this is the tail node.
     IO_REQUEST_NODE    *PrevRequest;                /// Pointer to the previous node in the list, or NULL if this is the head node.
     int                 RequestType;                /// One of IO_REQUEST_TYPE specifying the type of operation being performed.
-    int                 RequestState;               /// An integer value indicating the current state of the request.
+    uint32_t            Reserved;                   /// Reserved for future use; set to 0.
     HANDLE              FileHandle;                 /// The file handle associated with the request.
     OVERLAPPED          Overlapped;                 /// The OVERLAPPED instance associated with the asynchronous request.
     WCHAR              *PathBuffer;                 /// Pointer to a caller-managed buffer specifying the path of the file to LOAD or SAVE.
@@ -94,7 +128,6 @@ struct IO_REQUEST_NODE
     IO_REQUEST_COMPLETE CompletionCallback;         /// The callback to invoke when the operation has completed. May be NULL.
     uint64_t            SubmitTime;                 /// The timestamp (in ticks) at which the request was submitted by the application.
     uint64_t            LaunchTime;                 /// The timestamp (in ticks) at which the request was launched by the background I/O thread.
-    uint64_t            FinishTime;                 /// The timestamp (in ticks) at which the request was completed.
 };
 
 /// @summary Define the data associated with a doubly-linked list of IO_REQUEST_NODE.
@@ -184,10 +217,13 @@ enum IO_REQUEST_TYPE : int
 enum IO_REQUEST_STATE : int
 {
     IO_REQUEST_STATE_RECEIVED      =  0,            /// The request has been received, but not yet submitted to the kernel.
-    IO_REQUEST_STATE_IN_PROGRESS   =  1,            /// The request is a simple request (READ, WRITE) and has been submitted to the kernel.
+    IO_REQUEST_STATE_IN_PROGRESS   =  1,            /// The request has been submitted for processing by the operating system.
     IO_REQUEST_STATE_COMPLETED     =  2,            /// The request has completed successfully.
-    IO_REQUEST_STATE_ERROR         =  3,            /// The request has completed, and encountered an error.
-    // IO_REQUEST_STATE_LOAD_xxx
+    IO_REQUEST_STATE_ERROR         =  3,            /// The request has completed with an error.
+    IO_REQUEST_STATE_LOAD_READ     =  4,            /// The load request has opened the file, and needs to read the data.
+    IO_REQUEST_STATE_LOAD_CLOSE    =  5,            /// The load request has read the data, and needs to close the file.
+    IO_REQUEST_STATE_SAVE_WRITE    =  6,            /// The save request has opened the file, and needs to write the data.
+    IO_REQUEST_STATE_SAVE_CLOSE    =  7,            /// The save request has written the data, and needs to close the file.
 };
 
 /// @summary Define a name for the default number of threads that can submit asynchronous I/O requests.
@@ -229,17 +265,17 @@ enum FILE_DATA_FLAGS : uint32_t
 /*///////////////
 //   Globals   //
 ///////////////*/
-/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to AIO_COMPLETION_KEY_WAKEUP0 to indicate that one or more requests are waiting in request buffer 0.
-global_variable ULONG_PTR const AIO_COMPLETION_KEY_WAKEUP0  = 0;
+/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to IO_COMPLETION_KEY_WAKEUP0 to indicate that one or more requests are waiting in request buffer 0.
+global_variable ULONG_PTR const IO_COMPLETION_KEY_WAKEUP0  = 0;
 
-/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to AIO_COMPLETION_KEY_WAKEUP1 to indicate that one or more requests are waiting in request buffer 1.
-global_variable ULONG_PTR const AIO_COMPLETION_KEY_WAKEUP1  = 1;
+/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to IO_COMPLETION_KEY_WAKEUP1 to indicate that one or more requests are waiting in request buffer 1.
+global_variable ULONG_PTR const IO_COMPLETION_KEY_WAKEUP1  = 1;
 
-/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to AIO_COMPLETION_KEY_SHUTDOWN to terminate the asynchronous I/O thread loop.
-global_variable ULONG_PTR const AIO_COMPLETION_KEY_SHUTDOWN = 2;
+/// @summary OVERLAPPED_ENTRY::lpCompletionKey is set to IO_COMPLETION_KEY_SHUTDOWN to terminate the asynchronous I/O thread loop.
+global_variable ULONG_PTR const IO_COMPLETION_KEY_SHUTDOWN = 2;
 
 /// @summary OVERLAPPED_ENTRY::lpCompletionKey that is guaranteed to be an 'invalid' completion key.
-global_variable ULONG_PTR const AIO_COMPLETION_KEY_UNUSED   =~ULONG_PTR(0);
+global_variable ULONG_PTR const IO_COMPLETION_KEY_UNUSED   =~ULONG_PTR(0);
 
 /*//////////////////////////
 //   Internal Functions   //
@@ -489,6 +525,23 @@ GetIoTimestamp
     return (uint64_t) ticks.QuadPart;
 }
 
+/// @summary Given two timestamp values, calculate the number of whole nanoseconds elapsed between them.
+/// @param start_ticks The timestamp taken at the start of the measurement interval.
+/// @param finish_ticks The timestamp taken at the end of the measurement interval.
+/// @param clock_frequency The system high-resolution timer frequency, in ticks-per-second.
+/// @return The number of whole nanoseconds elapsed between the two timestamps.
+internal_function inline uint64_t
+GetIoNanosecondsElapsed
+(
+    uint64_t    start_ticks, 
+    uint64_t   finish_ticks, 
+    int64_t clock_frequency
+)
+{   // scale the tick value by the nanoseconds-per-second multiplier
+    // before scaling back down by ticks-per-second to avoid loss of precision.
+    return (1000000000ULL * (finish_ticks - start_ticks)) / uint64_t(clock_frequency);
+}
+
 /// @summary Classify a GetLastError() code returned from an I/O operation as successful or not successful.
 /// @param err The code returned by GetLastError(), or returned with the completed OVERLAPPED_ENTRY.
 /// @return true if the I/O operation completed successfully, or false otherwise.
@@ -506,60 +559,6 @@ ClassifyIoResult
     else
     {   // unknown result code - assume failure.
         return false;
-    }
-}
-
-/// @summary Complete an asynchronous I/O request.
-/// @param request The request being completed.
-/// @param file_handle The handle of the file associated with the request.
-/// @param bytes_transferred The number of bytes transferred to or from the request data buffer.
-/// @param result_code ERROR_SUCCESS or another operating system result code indicating the result of the operation.
-/// @param was_successful true if the I/O request completed successfully.
-internal_function void
-CompleteIoRequest
-(
-    IO_REQUEST_NODE const *request, 
-    int64_t      bytes_transferred, 
-    uint32_t           result_code
-)
-{
-    if (request->CompletionCallback != NULL)
-    {
-        IO_RESULT  res;
-        res.RequestType = request->RequestType;
-        res.ResultCode  = result_code;
-        res.UserContext = request->UserContext;
-        res.FileHandle  = request->FileHandle;
-        res.PathBuffer  = request->PathBuffer;
-        res.DataBuffer  = request->DataBuffer;
-        res.DataAmount  = bytes_transferred;
-        res.BaseOffset  = request->BaseOffset;
-        res.FileOffset  = request->FileOffset;
-        request->CompletionCallback(res, ClassifyIoResult(result_code));
-    }
-}
-
-/// @summary Complete a no-op or pass-through I/O request.
-/// @param request The request being completed.
-internal_function inline void
-CompleteIoRequest_Noop
-(
-    IO_REQUEST const *request
-)
-{
-    if (request->CompletionCallback != NULL)
-    {
-        IO_RESULT  res;
-        res.RequestType = IO_REQUEST_NOOP;
-        res.ResultCode  = ERROR_SUCCESS;
-        res.UserContext = request->UserContext;
-        res.FileHandle  = INVALID_HANDLE_VALUE;
-        res.PathBuffer  = request->PathBuffer;
-        res.DataBuffer  = request->DataBuffer;
-        res.DataAmount  = 0;
-        res.BaseOffset  = request->BaseOffset;
-        res.FileOffset  = request->FileOffset;
-        request->CompletionCallback(res, true);
     }
 }
 
@@ -622,7 +621,7 @@ EnqueueIoRequest
         if (ioq->Count != ioq->Capacity)
         {   // there's sufficient space in the buffer; enqueue the item.
             ioq->RequestBuffers[ioq->WriteBuffer][ioq->Count++] = req;
-            completion_key = AIO_COMPLETION_KEY_WAKEUP0 + ioq->WriteBuffer;
+            completion_key = IO_COMPLETION_KEY_WAKEUP0 + ioq->WriteBuffer;
             enqueue_count  = 1;
         }
     }
@@ -658,7 +657,7 @@ EnqueueIoRequest
     {   // figure out how many items can be enqueued and copy them into the write buffer.
         enqueue_avail  = ioq->Capacity -  ioq->Count;
         enqueue_count  = request_count <= enqueue_avail ? request_count : enqueue_avail;
-        completion_key = AIO_COMPLETION_KEY_WAKEUP0 + ioq->WriteBuffer;
+        completion_key = IO_COMPLETION_KEY_WAKEUP0 + ioq->WriteBuffer;
         CopyMemory(&ioq->RequestBuffers[ioq->WriteBuffer][ioq->Count], request_list, enqueue_count * sizeof(IO_REQUEST));
         ioq->Count    += enqueue_count;
     }
@@ -735,34 +734,23 @@ CreateIoRequestList
     return 0;
 }
 
-/// @summary Determine the initial state for an I/O request.
-/// @param request_type One of IO_REQUEST_TYPE.
-/// @return One of IO_REQUEST_STATE.
-internal_function int
-InitialIoRequestState
-(
-    int request_type
-)
-{   // TODO(rlk): something more complex can be done here.
-    UNREFERENCED_PARAMETER(request_type);
-    return IO_REQUEST_STATE_RECEIVED;
-}
-
 /// @summary Allocate and initialize a slot for an asynchronous I/O request. This should not be called for requests that do not have an asynchronous component.
 /// @param io The application I/O request parameters.
 /// @param request_list The I/O request list used to track active requests.
-/// @return The initialize request slot, or NULL if no slots are available.
+/// @param launch_time The timestamp, in ticks, at which the request was activated.
+/// @return The initialized request slot.
 internal_function IO_REQUEST_NODE*
 InitActiveIoRequest
 (
-    IO_REQUEST const &io,
-    IO_REQUEST_LIST *request_list
+    IO_REQUEST const          &io,
+    IO_REQUEST_LIST *request_list, 
+    uint64_t          launch_time
 )
 {
     IO_REQUEST_NODE   *node  = request_list->FreeList;
     if (request_list->Count != request_list->Capacity)
     {   // pop a node from the head of the free list; insert at the head of the active list.
-        request_list->FreeList = n->NextRequest;
+        request_list->FreeList = node->NextRequest;
         node->NextRequest = request_list->HeadNode;
         if (request_list->HeadNode != NULL)
         {
@@ -772,10 +760,9 @@ InitActiveIoRequest
         request_list->Count++;
 
         // initialize the node with data from the user request.
-        node->PrevRequest  = NULL;
-        node->RequestType  = io.RequestType;
-        node->RequestState = InitialIoRequestState(io.RequestType);
-        node->FileHandle   = io.FileHandle;
+        node->PrevRequest = NULL;
+        node->RequestType = io.RequestType;
+        node->FileHandle  = io.FileHandle;
         ZeroMemory(&node->Overlapped, sizeof(OVERLAPPED));
 
         node->PathBuffer  = io.PathBuffer;
@@ -785,10 +772,29 @@ InitActiveIoRequest
         node->UserContext = io.UserContext;
         node->CompletionCallback = io.IoComplete;
         node->SubmitTime  = io.SubmitTime;
-        node->LaunchTime  = GetIoTimestamp();
-        node->FinishTime  = node->LaunchTime;
+        node->LaunchTime  = launch_time;
     }
     return node;
+}
+
+/// @summary Retire an active asynchronous I/O request, returning it to the free list. The caller is responsible for completing the request.
+/// @param node The IO_REQUEST_NODE corresponding to the completed request.
+/// @param request_list The IO_REQUEST_LIST from which the node was allocated.
+/// @param bytes_transferred The number of bytes transferred (read or written.)
+/// @param result_code The system code indicating the result of the operation.
+internal_function void
+RetireActiveIoRequest
+(
+    IO_REQUEST_NODE         *node, 
+    IO_REQUEST_LIST *request_list
+)
+{   // remove the node from the active list and insert it at the head of the free list.
+    if (node->NextRequest != NULL)
+        node->NextRequest->PrevRequest = node->PrevRequest;
+    if (node->PrevRequest != NULL)
+        node->PrevRequest->NextRequest = node->NextRequest;
+    node->NextRequest      = request_list->FreeList;
+    request_list->FreeList = node;
 }
 
 /// @summary Retrieve the IO_REQUEST_NODE for an OVERLAPPED address associated with an active request slot.
@@ -801,43 +807,6 @@ ActiveIoRequestForOVERLAPPED
 )
 {
     return ((IO_REQUEST_NODE*)(((uint8_t*) overlapped) - offsetof(IO_REQUEST_NODE, Overlapped)));
-}
-
-/// @summary Complete and retire an active asynchronous I/O request.
-/// @param node The IO_REQUEST_NODE corresponding to the completed request.
-/// @param request_list The IO_REQUEST_LIST from which the node was allocated.
-/// @param bytes_transferred The number of bytes transferred (read or written.)
-/// @param result_code The system code indicating the result of the operation.
-internal_function void
-RetireActiveIoRequest
-(
-    IO_REQUEST_NODE         *node, 
-    IO_REQUEST_LIST *request_list,
-    DWORD       bytes_transferred, 
-    DWORD             result_code
-)
-{   // complete the I/O request by invoking the user callback.
-    if (node->CompletionCallback != NULL)
-    {
-        IO_RESULT  res;
-        res.RequestType = request->RequestType;
-        res.ResultCode  = result_code;
-        res.UserContext = request->UserContext;
-        res.FileHandle  = request->FileHandle;
-        res.PathBuffer  = request->PathBuffer;
-        res.DataBuffer  = request->DataBuffer;
-        res.DataAmount  = bytes_transferred;
-        res.BaseOffset  = request->BaseOffset;
-        res.FileOffset  = request->FileOffset;
-        request->CompletionCallback(res, ClassifyIoResult(result_code));
-    }
-    // remove the node from the active list and insert it at the head of the free list.
-    if (node->NextRequest != NULL)
-        node->NextRequest->PrevRequest = node->PrevRequest;
-    if (node->PrevRequest != NULL)
-        node->PrevRequest->NextRequest = node->NextRequest;
-    node->NextRequest      = request_list->FreeList;
-    request_list->FreeList = node;
 }
 
 /// @summary Initialize an IO_ASYNC_STATE object.
@@ -864,7 +833,7 @@ CreateIoAsyncState
 
     // create an I/O completion port used to receive asynchronous I/O completion notifications 
     // and signals when I/O requests are posted to the associated IO_REQUEST_QUEUE.
-    if ((iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, AIO_COMPLETION_KEY_UNUSED, (DWORD) submit_threads)) == NULL)
+    if ((iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, IO_COMPLETION_KEY_UNUSED, (DWORD) submit_threads)) == NULL)
     {
         ConsoleError("ERROR: %S(%u): Unable to create asynchronous I/O completion port (%08X).\n", __FUNCTION__, GetCurrentThreadId(), GetLastError());
         goto cleanup_and_fail;
@@ -1246,220 +1215,18 @@ IoFreeFileData
     ZeroMemory(data, sizeof(FILE_DATA));
 }
 
-// TODO(rlk): need to refactor this.
-// when swapping buffers, track total number of events in buffer, and number consumed.
-// have list (doubly-linked list!) of active requests, each with state. pointer to list node can be supplied as completion key (associated with file handle when file is opened.)
-// - this works because there's no circumstance where we need to iterate over the active requests.
-// - pool of request (intrinsic list) nodes allocated at init time.
-// - can keep overlapped, etc. all together in one place.
-// - can nicely keep timing information for profiling.
-// - large-ish nodes, ie. 128 bytes.
-// - requests have state, to support complex requests (like LOAD) - has OPEN, READ and CLOSE.
-// events from IOCP are either:
-// - I/O completion
-//   - copied into separate completion buffer
-// - buffer swap notification (ie. I/O requests are waiting)
-//   - if buffer ID != current buffer ID, set flag indicating swap required and flip current buffer ID
-// - shutdown notification
-//   - set flag, and then drop
-// limit on IOCP events retrieved at any given time
-// - say 512
-// process completion buffer first
-// then pop one pending request at a time from the request buffer
-// - if it's a non-trivial synchronous request (OPEN or FLUSH) add to a deferrment list
-// - if it's a CLOSE request, process it immediately
-// - if it's a READ, WRITE, LOAD or SAVE request:
-//   - if you can get a list node, an active request slot is available
-//   - if not, stop processing immediately - need to wait for some completions
-// - if there are no more requests in the request buffer:
-//   - if the swap flag is set, swap the buffers
-
-public_function unsigned int __cdecl
-IoBackgroundThreadMain
+/// @summary Execute a low-level file open operation.
+/// @param args Information about the file to open. The FilePath and IoHintFlags fields must be set.
+/// @param result Information returned from the operation specifying the file handle and whether the operation completed successfully.
+/// @param file_info If this argument is not NULL, information about the file is stored here on return.
+/// @param sector_size If this argument is not NULL, the physical device sector size is stored here on return.
+public_function void
+IoExecuteOpen
 (
-    void *argp
-)
-{
-    IO_BACKGROUND_THREAD_ARGS args = {};
-    IO_REQUEST_QUEUE          *ioq = NULL;
-    IO_REQUEST_LIST           *rql = NULL;
-    IO_ASYNC_STATE            *aio = NULL;
-    OVERLAPPED_ENTRY       *evtbuf = NULL;
-    ULONG_PTR       completion_key = AIO_COMPLETION_KEY_UNUSED;
-    HANDLE                    iocp = NULL;
-    DWORD                thread_id = GetCurrentThreadId();
-    DWORD               max_events = 0;
-    bool             more_requests = false;
-
-    // copy argument data into a thread-local instance.
-    CopyMemory(&args, argp, sizeof(IO_BACKGROUND_THREAD_ARGS));
-    max_events = (DWORD) args.AIOState->MaxCompletions;
-    evtbuf = args.AIOState->CompletionBuffer;
-    aio = args.AIOState; ioq = args.AIOQueue;
-    rql =&args.AIOState->ActiveRequests;
-    iocp= args.AIOState->CompletionPort;
-
-    for ( ; ; )
-    {   // wait until events are available on the completion port, indicating:
-        // 1. one or more I/O requests have been completed by the kernel
-        // 2. one or more I/O requests have been submitted by the application
-        // 3. the application has requested the thread to shut down
-        ULONG num_events = 0; // the number of completion port events returned
-        if (!GetQueuedCompletionStatusEx(iocp, evtbuf, max_events, &num_events, INFINITE, FALSE))
-        {
-            ConsoleError("ERROR: %S(%u): Background I/O thread failed waiting on completion port (%08X).\n", __FUNCTION__, GetCurrentThreadId(), GetLastError());
-            goto terminate_thread;
-        }
-        // process the received event notifications and complete active requests.
-        for (ULONG evi = 0; evi < num_events; ++evi)
-        {
-            if (evtbuf[i].lpOverlapped != NULL)
-            {   // this is a completed I/O request.
-                IO_REQUEST_NODE  *node  = ActiveIoRequestForOVERLAPPED(evtbuf[i].lpOverlapped);
-                int64_t    transferred  = evtbuf[i].dwNumberOfBytesTransferred;
-                DWORD       error_code  = HRESULT_FROM_NT(evtbuf[i].Internal);
-                // TODO(rlk): need to update the request state here.
-                // which may retire the request.
-            }
-            else
-            {   // this is some kind of thread notification.
-                switch (evtbuf[i].lpCompletionKey)
-                {
-                    case AIO_COMPLETION_KEY_WAKEUP0:
-                    case AIO_COMPLETION_KEY_WAKEUP1:
-                        { // if the completion key doesn't match the current request_buffer, queue a buffer swap.
-                          // this can happen at most once per-iteration of the outermost loop.
-                          // if the completion key matches the current request buffer, ignore the event
-                          // as it has already been retrieved with the most recent buffer swap.
-                          if (evtbuf[i].lpCompletionKey != completion_key)
-                          {   // queue a buffer swap when the current buffer is exhausted.
-                              aio->IoStateFlags |= IO_ASYNC_STATE_FLAG_SWAP;
-                              completion_key     = evtbuf[i].lpCompletionKey;
-                          }
-                        } break;
-                    case AIO_COMPLETION_KEY_SHUTDOWN:
-                        { ConsoleOutput("DEATH: %S(%u): Background I/O thread received shutdown signal.\n", __FUNCTION__, GetCurrentThreadId());
-                          aio->IoStateFlags |= IO_ASYNC_STATE_FLAG_SHUTDOWN;
-                        } goto terminate_thread;
-                    default:
-                        { ConsoleError("ERROR: %S(%u): Background I/O thread received unknown signal %p.\n", __FUNCTION__, GetCurrentThreadId(), evt.lpCompletionKey);
-                        } break;
-                }
-            }
-        }
-        do
-        {   // process requests received from the application.
-            if (aio->RequestIndex == aio->RequestCount)
-            {   // there are no additional requests in the current buffer.
-                if (aio->IoStateFlags & IO_ASYNC_STATE_FLAG_SWAP)
-                {   // there are one or more I/O requests waiting, so retrieve them all in one go.
-                    // this updates aio->RequestCount with the number of requests retrieved.
-                    aio->RequestBuffer = RetrieveWaitingIoRequests(ioq, aio->RequestCount);
-                    aio->IoStateFlags &=~IO_ASYNC_STATE_FLAG_SWAP;
-                    aio->RequestIndex  = 0;
-                }
-                if (aio->RequestIndex == aio->RequestCount)
-                {   // there are no more requests pending.
-                    // immediately terminate this loop and go back to sleep.
-                    break;
-                }
-            }
-
-            IO_REQUEST app_request = aio->RequestBuffer[aio->RequestIndex];
-            switch (app_request.RequestType)
-            {
-                case IO_REQUEST_NOOP:
-                    { CompleteIoRequest_Noop(&app_request);
-                      aio->RequestIndex++;
-                    } break;
-                case IO_REQUEST_READ:
-                    { // asynchronous, simple.
-                    } break;
-                case IO_REQUEST_WRITE:
-                    { // asynchronous, simple.
-                    } break;
-                case IO_REQUEST_FLUSH:
-                    { // flush any pending writes - always synchronous.
-                      DWORD result_code = ERROR_SUCCESS;
-                      if (!FlushFileBuffers(app_request.FileHandle))
-                      {   // the buffered data could not be flushed, save the error code.
-                          result_code = GetLastError();
-                      }
-                      CompleteIoRequest(&app_request, 0, result_code);
-                      aio->RequestIndex++;
-                    } break;
-                case IO_REQUEST_CLOSE:
-                    { // close handle - always synchronous.
-                      DWORD result_code = ERROR_SUCCESS;
-                      if (!CloseHandle(app_request.FileHandle))
-                      {   // the handle could not be closed, save the error code.
-                          result_code = GetLastError();
-                      }
-                      CompleteIoRequest(&app_request, 0, result_code);
-                      aio->RequestIndex++;
-                    } break;
-                case IO_REQUEST_LOAD:
-                    { // asynchronous, multi-state.
-                    } break;
-                case IO_REQUEST_SAVE:
-                    { // asynchronous, multi-state.
-                    } break;
-            }
-        } while (more_requests);
-    }
-
-terminate_thread:
-    return 0;
-}
-
-struct AIO_INPUT
-{
-    HANDLE      FileHandle;
-    OVERLAPPED *Overlapped;
-    void       *DataBuffer;
-    int64_t     FileOffset;
-    uint32_t    TransferAmount;
-};
-
-struct AIO_OUTPUT
-{
-    HANDLE      FileHandle;
-    DWORD       ResultCode;
-    uint32_t    TransferAmount;
-    bool        CompletedSynchronously;
-    bool        WasSuccessful;
-};
-
-/// @summary Calculate the absolute filesystem offset for an I/O operation.
-/// @param slot The asynchronous I/O request slot associated with the operation.
-/// @return The absolute filesystem byte offset.
-internal_function inline int64_t
-AioAbsoluteFileOffset
-(
-    IO_REQUEST_NODE const *slot
-)
-{
-    return slot->BaseOffset + slot->FileOffset;
-}
-
-/// @summary Calculate the absolute filesystem offset for an I/O operation.
-/// @param io The asynchronous I/O request associated with the operation.
-/// @return The absolute filesystem byte offset.
-internal_function inline int64_t
-AioAbsoluteFileOffset
-(
-    IO_REQUEST const *io
-)
-{
-    return io->BaseOffset + io->FileOffset;
-}
-
-internal_function void
-AioExecuteOpen
-(
-    IO_REQUEST   &args, 
-    HANDLE        iocp,
-    AIO_OUTPUT &result
+    IO_OPERATION            &args, 
+    IO_OPERATION_RESULT   &result, 
+    FILE_STANDARD_INFO *file_info, 
+    size_t           *sector_size
 )
 {
     HANDLE    fd = INVALID_HANDLE_VALUE;
@@ -1482,7 +1249,6 @@ AioExecuteOpen
     if (args.IoHintFlags & IO_HINT_FLAG_WRITE)
     {
         access |= GENERIC_WRITE;
-        share   = FILE_SHARE_NONE;
         flags   = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
         if (args.IoHintFlags & IO_HINT_FLAG_OVERWRITE)
         {   // opening the file will always succeed.
@@ -1519,69 +1285,125 @@ AioExecuteOpen
     {   // writes are immediately flushed to disk, if possible.
         flags |= FILE_FLAG_WRITE_THROUGH;
     }
-    if ((fd = CreateFile(args.PathBuffer, access, share, NULL, create, flags, NULL)) == INVALID_HANDLE_VALUE)
+    if ((fd = CreateFile(args.FilePath, access, share, NULL, create, flags, NULL)) == INVALID_HANDLE_VALUE)
     {
-        ConsoleError("ERROR: %S(%u): Failed to open file \"%s\" (%08X).\n", __FUNCTION__, GetCurrentThreadId(), args.PathBuffer, GetLastError());
-        args.FileHandle = INVALID_HANDLE_VALUE;
-        args.ResultCode = GetLastError();
-        args.TransferAmount = 0;
-        args.CompletedSynchronously = true;
-        args.WasSuccessful = false;
+        ConsoleError("ERROR: %S(%u): Failed to open file \"%s\" (%08X).\n", __FUNCTION__, GetCurrentThreadId(), args.FilePath, GetLastError());
+        result.FileHandle = INVALID_HANDLE_VALUE;
+        result.ResultCode = GetLastError();
+        result.TransferAmount = 0;
+        result.CompletedSynchronously = true;
+        result.WasSuccessful = false;
         return;
     }
-    if (CreateIoCompletionPort(fd, iocp, AIO_COMPLETION_KEY_UNUSED, 0) != iocp)
+    if (args.CompletionPort != NULL && CreateIoCompletionPort(fd, args.CompletionPort, IO_COMPLETION_KEY_UNUSED, 0) != args.CompletionPort)
     {
-        ConsoleError("ERROR: %S(%u): Unable to associate file handle with I/O completion port (%08X).\n", __FUNCTION__, GetCurrentThreadId(), GetLastError());
-        args.FileHandle = INVALID_HANDLE_VALUE;
-        args.ResultCode = GetLastError();
-        args.TransferAmount = 0;
-        args.CompletedSynchronously = true;
-        args.WasSuccessful = false;
+        ConsoleError("ERROR: %S(%u): Unable to associate file \"%s\" with I/O completion port (%08X).\n", __FUNCTION__, GetCurrentThreadId(), args.FilePath, GetLastError());
+        result.FileHandle = INVALID_HANDLE_VALUE;
+        result.ResultCode = GetLastError();
+        result.TransferAmount = 0;
+        result.CompletedSynchronously = true;
+        result.WasSuccessful = false;
         CloseHandle(fd);
         return;
     }
+    if (args.CompletionPort != NULL)
     {   // immediately complete requests that execute synchronously; don't post completion port notification.
+        // this reduces traffic on the completion port and improves performance for asynchronous requests.
         SetFileCompletionNotificationModes(fd, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
     }
-    if (args.IoHintFlags & IO_HINT_FLAG_PREALLOCATE)
+    if ((args.IoHintFlags & IO_HINT_FLAG_PREALLOCATE) && args.PreallocationSize > 0)
     {   // preallocate storage space for the file data, which can significantly improve performance when writing large files.
-        // TODO(rlk): SetFilePointerEx
-        // TODO(rlk): SetEndOfFile
-        // TODO(rlk): warn about performance if not writing sequentially.
-        // see https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573/
+        // this can be slower for large files if the file is not written sequentially.
+        LARGE_INTEGER new_ptr; new_ptr.QuadPart = args.PreallocationSize;
+        if (SetFilePointerEx(fd, new_ptr, NULL, FILE_BEGIN))
+        {   // set the end-of-file marker to the new location.
+            if (SetEndOfFile(fd))
+            {   // move the file pointer back to the start of the file.
+                new_ptr.QuadPart = 0;
+                SetFilePointerEx(fd, new_ptr, NULL, FILE_BEGIN);
+            }
+            else
+            {   // this is a non-fatal error since preallocation is an optimization.
+                ConsoleError("ERROR: %S(%u): Failed to preallocate file \"%s\" to %I64d bytes. SetEndOfFile failed (%08X).\n", __FUNCTION__, GetCurrentThreadId(), args.FilePath, args.PreallocationSize, GetLastError()); 
+            }
+        }
+        else
+        {   // this is a non-fatal error since preallocation is an optimization.
+            ConsoleError("ERROR: %S(%u): Failed to preallocate file \"%s\" to %I64d bytes. SetFilePointerEx failed (%08X).\n", __FUNCTION__, GetCurrentThreadId(), args.FilePath, args.PreallocationSize, GetLastError()); 
+        }
     }
+    if (file_info != NULL)
+    {   // retrieve the end-of-file (logical file size) and allocation size (physical size).
+        ZeroMemory(file_info, sizeof(FILE_STANDARD_INFO));
+        if (!GetFileInformationByHandleEx(fd, FileStandardInfo, file_info, sizeof(FILE_STANDARD_INFO)))
+        {   // this is a non-fatal error since it's just an information request.
+            ConsoleError("ERROR: %S(%u): Failed to retrieve attributes for file \"%s\" (%08X).\n", __FUNCTION__, GetCurrentThreadId(), args.FilePath, GetLastError());
+        }
+    }
+    if (sector_size != NULL)
+    {   // retrieve the physical device sector size. this value is necessary for unbuffered I/O operations, 
+        // where the buffer address and transfer size must be a multiple of the physical device sector size.
+        STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR desc;
+        STORAGE_PROPERTY_QUERY query;
+        DWORD bytes = 0;
+        ZeroMemory(&desc , sizeof(STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR));
+        ZeroMemory(&query, sizeof(STORAGE_PROPERTY_QUERY));
+        query.QueryType  = PropertyStandardQuery;
+        query.PropertyId = StorageAccessAlignmentProperty;
+        if (DeviceIoControl(fd, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &desc, sizeof(desc), &bytes, NULL))
+        {   // save the physical device sector size.
+           *sector_size  = desc.BytesPerPhysicalSector; 
+        }
+        else
+        {   // this is a non-fatal error; return a default that will work for all common disks.
+            ConsoleError("ERROR: %S(%u): Failed to retrieve physical device sector size for file \"%s\" (%08X).\n", __FUNCTION__, GetCurrentThreadId(), args.FilePath, GetLastError());
+           *sector_size = 4096;
+        }
+    }
+    result.FileHandle = fd;
+    result.ResultCode = GetLastError();
+    result.TransferAmount = 0;
+    result.CompletedSynchronously = true;
+    result.WasSuccessful = true;
 }
-/*struct IO_REQUEST
-{
-    int                 RequestType;                /// One of IO_REQUEST_TYPE specifying the type of operation to perform.
-    uint32_t            IoHintFlags;                /// One or more of IO_HINT_FLAGS, specifying hints that may be used to optimize the I/O operation.
-    uintptr_t           UserContext;                /// Opaque data associated with the request to be passed through to the completion callback.
-    HANDLE              FileHandle;                 /// The handle of the file associated with the READ, WRITE or FLUSH request.
-    WCHAR              *PathBuffer;                 /// Pointer to a caller-managed buffer specifying the path of the file to OPEN, LOAD or SAVE.
-    void               *DataBuffer;                 /// The caller-managed buffer from which to READ/LOAD or WRITE/SAVE data, or NULL for NOOP, OPEN and FLUSH requests.
-    int64_t             DataAmount;                 /// The number of bytes to transfer to or from the caller-managed data buffer.
-    int64_t             BaseOffset;                 /// The byte offset of the start of the operation from the start of the physical file.
-    int64_t             FileOffset;                 /// The byte offset of the start of the operation from the start of the logical file.
-    uint64_t            SubmitTime;                 /// The timestamp (in ticks) at which the request was submitted by the application.
-    IO_REQUEST_COMPLETE IoComplete;                 /// The callback to invoke when the operation has completed.
-};*/
 
-internal_function void
-AioExecuteRead
+/// @summary Execute a synchronous or asynchronous read operation.
+/// @param args Information about the read operation. The FileHandle, DataBuffer and TransferAmount fields must be set.
+/// @param result Information returned from the operation specifying the number of bytes transferred and whether the operation completed successfully.
+public_function void
+IoExecuteRead
 (
-    AIO_INPUT    &args,
-    AIO_OUTPUT &result
+    IO_OPERATION          &args,
+    IO_OPERATION_RESULT &result
 )
-{   // the request is submitted to be performed asynchronously, but can complete
+{   
+    DWORD transferred = 0;
+    // the request is submitted to be performed asynchronously, but can complete
     // either synchronously or asynchronously. this routine hides that complexity.
-    args.Overlapped->Internal     = 0;
-    args.Overlapped->InternalHigh = 0;
-    args.Overlapped->Offset       =(DWORD) (args.FileOffset        & 0xFFFFFFFFUL);
-    args.Overlapped->OffsetHigh   =(DWORD)((args.FileOffset >> 32) & 0xFFFFFFFFUL);
-    if (ReadFile(args.FileHandle, args.DataBuffer, args.TransferAmount, &result.TransferAmount, args.Overlapped))
+    if (args.Overlapped)
+    {   // populate the required fields of the OVERLAPPED strucure for an asynchronous request.
+        args.Overlapped->Internal     = 0;
+        args.Overlapped->InternalHigh = 0;
+        args.Overlapped->Offset       =(DWORD) (args.FileOffset        & 0xFFFFFFFFUL);
+        args.Overlapped->OffsetHigh   =(DWORD)((args.FileOffset >> 32) & 0xFFFFFFFFUL);
+    }
+    else if (args.FileOffset >= 0)
+    {   // for synchronous I/O, support implicit seeking within the file.
+        LARGE_INTEGER new_ptr; new_ptr.QuadPart = args.FileOffset;
+        if (!SetFilePointerEx(args.FileHandle, new_ptr, NULL, FILE_BEGIN))
+        {   // the seek operation failed - fail the read operation.
+            result.FileHandle = args.FileHandle;
+            result.ResultCode = GetLastError();
+            result.CompletedSynchronously = true;
+            result.WasSuccessful = false;
+            return;
+        }
+    }
+    if (ReadFile(args.FileHandle, args.DataBuffer, args.TransferAmount, &transferred, args.Overlapped))
     {   // the read operation completed synchronously (likely the data was in-cache.)
         result.FileHandle = args.FileHandle;
         result.ResultCode = GetLastError();
+        result.TransferAmount = transferred;
         result.CompletedSynchronously = true;
         result.WasSuccessful = true;
     }
@@ -1600,43 +1422,58 @@ AioExecuteRead
             case ERROR_HANDLE_EOF:
                 { // attempt to read past end-of-file; result.TransferAmount is set to the number of bytes available.
                   result.FileHandle = args.FileHandle;
+                  result.TransferAmount = transferred;
                   result.CompletedSynchronously = true;
                   result.WasSuccessful = true;
                 } break;
             default:
                 { // an actual error occurred.
                   result.FileHandle = args.FileHandle;
+                  result.TransferAmount = transferred;
                   result.CompletedSynchronously = true;
                   result.WasSuccessful = false;
                 } break;
         }
-    IO_HINT_FLAGS_NONE             = (0 << 0),      /// No I/O hints are specified, use the default behavior appropriate for the I/O request type.
-    IO_HINT_FLAG_READ              = (1 << 0),      /// Read operations will be issued against the file.
-    IO_HINT_FLAG_WRITE             = (1 << 1),      /// Write operations will be issues against the file.
-    IO_HINT_FLAG_OVERWRITE         = (1 << 2),      /// The existing file contents should be discarded.
-    IO_HINT_FLAG_PREALLOCATE       = (1 << 3),      /// Preallocate the file to the size specified in the IO_REQUEST::DataAmount field.
-    IO_HINT_FLAG_SEQUENTIAL        = (1 << 4),      /// Optimize for sequential access when performing cached/buffered I/O (valid for OPEN, LOAD and SAVE.)
-    IO_HINT_FLAG_UNCACHED          = (1 << 5),      /// Indicate that the I/O should bypass the OS page cache, and that the source or destination buffer meets sector alignment requirements (valid for OPEN, LOAD and SAVE).
-    IO_HINT_FLAG_WRITE_THROUGH
     }
 }
 
-internal_function void
-AioExecuteWrite
+/// @summary Execute a synchronous or asynchronous write operation.
+/// @param args Information about the write operation. The FileHandle, DataBuffer and TransferAmount fields must be set.
+/// @param result Information returned from the operation specifying the number of bytes transferred and whether the operation completed successfully.
+public_function void
+IoExecuteWrite
 (
-    AIO_INPUT    &args, 
-    AIO_OUTPUT &result
+    IO_OPERATION          &args, 
+    IO_OPERATION_RESULT &result
 )
-{   // the request is submitted to be performed asynchronously, but can complete
+{   
+    DWORD transferred = 0;
+    // the request is submitted to be performed asynchronously, but can complete
     // either synchronously or asynchronously. this routine hides that complexity.
-    args.Overlapped->Internal     = 0;
-    args.Overlapped->InternalHigh = 0;
-    args.Overlapped->Offset       =(DWORD) (args.FileOffset        & 0xFFFFFFFFUL);
-    args.Overlapped->OffsetHigh   =(DWORD)((args.FileOffset >> 32) & 0xFFFFFFFFUL);
-    if (WriteFile(args.FileHandle, args.DataBuffer, args.TransferAmount, &result.TransferAmount, args.Overlapped))
+    if (args.Overlapped)
+    {   // populate the required fields of the OVERLAPPED strucure for an asynchronous request.
+        args.Overlapped->Internal     = 0;
+        args.Overlapped->InternalHigh = 0;
+        args.Overlapped->Offset       =(DWORD) (args.FileOffset        & 0xFFFFFFFFUL);
+        args.Overlapped->OffsetHigh   =(DWORD)((args.FileOffset >> 32) & 0xFFFFFFFFUL);
+    }
+    else if (args.FileOffset >= 0)
+    {   // for synchronous I/O, support implicit seeking within the file.
+        LARGE_INTEGER new_ptr; new_ptr.QuadPart = args.FileOffset;
+        if (!SetFilePointerEx(args.FileHandle, new_ptr, NULL, FILE_BEGIN))
+        {   // the seek operation failed - fail the write operation.
+            result.FileHandle = args.FileHandle;
+            result.ResultCode = GetLastError();
+            result.CompletedSynchronously = true;
+            result.WasSuccessful = false;
+            return;
+        }
+    }
+    if (WriteFile(args.FileHandle, args.DataBuffer, args.TransferAmount, &transferred, args.Overlapped))
     {   // the write operation completed synchronously.
         result.FileHandle = args.FileHandle;
         result.ResultCode = GetLastError();
+        result.TransferAmount = transferred;
         result.CompletedSynchronously = true;
         result.WasSuccessful = true;
     }
@@ -1655,6 +1492,7 @@ AioExecuteWrite
             default:
                 { // an actual error occurred.
                   result.FileHandle = args.FileHandle;
+                  result.TransferAmount = transferred;
                   result.CompletedSynchronously = true;
                   result.WasSuccessful = false;
                 } break;
@@ -1662,4 +1500,404 @@ AioExecuteWrite
     }
 }
 
+/// @summary Execute a synchronous flush operation.
+/// @param args Information about the flush operation. The FileHandle field must be set.
+/// @param result Information returned from the operation specifying whether the operation completed successfully.
+public_function void
+IoExecuteFlush
+(
+    IO_OPERATION          &args, 
+    IO_OPERATION_RESULT &result
+)
+{
+    if (FlushFileBuffers(args.FileHandle))
+    {
+        result.FileHandle = args.FileHandle;
+        result.ResultCode = GetLastError();
+        result.TransferAmount = 0;
+        result.CompletedSynchronously = true;
+        result.WasSuccessful = true;
+    }
+    else
+    {
+        result.FileHandle = args.FileHandle;
+        result.ResultCode = GetLastError();
+        result.TransferAmount = 0;
+        result.CompletedSynchronously = true;
+        result.WasSuccessful = false;
+    }
+}
+
+/// @summary Execute a synchronous file close operation.
+/// @param args Information about the close operation. The FileHandle field must be set.
+/// @param result Information returned from the operation specifying whether the operation completed successfully.
+public_function void
+IoExecuteClose
+(
+    IO_OPERATION          &args, 
+    IO_OPERATION_RESULT &result
+)
+{
+    if (CloseHandle(args.FileHandle))
+    {
+        result.FileHandle = args.FileHandle;
+        result.ResultCode = GetLastError();
+        result.TransferAmount = 0;
+        result.CompletedSynchronously = true;
+        result.WasSuccessful = true;
+    }
+    else
+    {
+        result.FileHandle = args.FileHandle;
+        result.ResultCode = GetLastError();
+        result.TransferAmount = 0;
+        result.CompletedSynchronously = true;
+        result.WasSuccessful = false;
+    }
+}
+
+/// @summary Implements the entry point and main loop for the background I/O thread.
+/// @param argp Pointer to an IO_BACKGROUND_THREAD_ARGS instance that should be copied into thread-local memory.
+/// @return This function always returns zero.
+public_function unsigned int __cdecl
+IoBackgroundThreadMain
+(
+    void *argp
+)
+{
+    IO_BACKGROUND_THREAD_ARGS args = {};
+    IO_OPERATION_RESULT      opres = {};
+    IO_OPERATION             opreq = {};
+    IO_REQUEST_QUEUE          *ioq = NULL;
+    IO_REQUEST_LIST           *rql = NULL;
+    IO_ASYNC_STATE            *aio = NULL;
+    OVERLAPPED_ENTRY       *evtbuf = NULL;
+    ULONG_PTR       completion_key = IO_COMPLETION_KEY_UNUSED;
+    HANDLE                    iocp = NULL;
+    DWORD               max_events = 0;
+    LARGE_INTEGER  clock_frequency;
+
+    // copy argument data into a thread-local instance.
+    CopyMemory(&args, argp, sizeof(IO_BACKGROUND_THREAD_ARGS));
+    max_events = (DWORD) args.AIOState->MaxCompletions;
+    evtbuf = args.AIOState->CompletionBuffer;
+    aio = args.AIOState; ioq = args.AIOQueue;
+    rql =&args.AIOState->ActiveRequests;
+    iocp= args.AIOState->CompletionPort;
+
+    // retrieve the clock frequency used to convert timestamps to nanoseconds.
+    QueryPerformanceFrequency(&clock_frequency);
+#define NS_ELAPSED(s, e) \
+    GetIoNanosecondsElapsed((s), (e), clock_frequency.QuadPart)
+
+    for ( ; ; )
+    {   // wait until events are available on the completion port, indicating:
+        // 1. one or more I/O requests have been completed by the kernel
+        // 2. one or more I/O requests have been submitted by the application
+        // 3. the application has requested the thread to shut down
+        ULONG num_events = 0; // the number of completion port events returned
+        if (!GetQueuedCompletionStatusEx(iocp, evtbuf, max_events, &num_events, INFINITE, FALSE))
+        {
+            ConsoleError("ERROR: %S(%u): Background I/O thread failed waiting on completion port (%08X).\n", __FUNCTION__, GetCurrentThreadId(), GetLastError());
+            goto terminate_thread;
+        }
+        // process the received event notifications and complete active requests.
+        for (ULONG evi = 0; evi < num_events; ++evi)
+        {
+            if (evtbuf[evi].lpOverlapped != NULL)
+            {   // this is a completed I/O request (read or write operation.)
+                IO_REQUEST_NODE  *node  = ActiveIoRequestForOVERLAPPED(evtbuf[evi].lpOverlapped);
+                int64_t    transferred  = evtbuf[evi].dwNumberOfBytesTransferred;
+                DWORD       error_code  = HRESULT_FROM_NT(evtbuf[evi].Internal);
+                if (node->CompletionCallback != NULL)
+                {   IO_RESULT res;
+                    res.RequestType = node->RequestType;
+                    res.ResultCode  = error_code;
+                    res.UserContext = node->UserContext;
+                    res.FileHandle  = node->FileHandle;
+                    res.PathBuffer  = node->PathBuffer;
+                    res.DataBuffer  = node->DataBuffer;
+                    res.DataAmount  = transferred;
+                    res.BaseOffset  = node->BaseOffset;
+                    res.FileOffset  = node->FileOffset;
+                    node->CompletionCallback(res, NS_ELAPSED(node->SubmitTime, node->LaunchTime), NS_ELAPSED(node->LaunchTime, GetIoTimestamp()), ClassifyIoResult(error_code));
+                }
+                RetireActiveIoRequest(node, rql);
+            }
+            else
+            {   // this is some kind of thread notification.
+                switch (evtbuf[evi].lpCompletionKey)
+                {
+                    case IO_COMPLETION_KEY_WAKEUP0:
+                    case IO_COMPLETION_KEY_WAKEUP1:
+                        { // if the completion key doesn't match the current request_buffer, queue a buffer swap.
+                          // this can happen at most once per-iteration of the outermost loop.
+                          // if the completion key matches the current request buffer, ignore the event
+                          // as it has already been retrieved with the most recent buffer swap.
+                          if (evtbuf[evi].lpCompletionKey != completion_key)
+                          {   // queue a buffer swap when the current buffer is exhausted.
+                              aio->IoStateFlags |= IO_ASYNC_STATE_FLAG_SWAP;
+                              completion_key     = evtbuf[evi].lpCompletionKey;
+                          }
+                        } break;
+                    case IO_COMPLETION_KEY_SHUTDOWN:
+                        { ConsoleOutput("DEATH: %S(%u): Background I/O thread received shutdown signal.\n", __FUNCTION__, GetCurrentThreadId());
+                          aio->IoStateFlags |= IO_ASYNC_STATE_FLAG_SHUTDOWN;
+                        } goto terminate_thread;
+                    default:
+                        { ConsoleError("ERROR: %S(%u): Background I/O thread received unknown signal %p.\n", __FUNCTION__, GetCurrentThreadId(), (void*) evtbuf[evi].lpCompletionKey);
+                        } break;
+                }
+            }
+        }
+
+        for ( ; ; )
+        {   // process requests received from the application.
+            if (aio->RequestIndex == aio->RequestCount)
+            {   // there are no additional requests in the current buffer.
+                if (aio->IoStateFlags & IO_ASYNC_STATE_FLAG_SWAP)
+                {   // there are one or more I/O requests waiting, so retrieve them all in one go.
+                    // this updates aio->RequestCount with the number of requests retrieved.
+                    aio->RequestBuffer = RetrieveWaitingIoRequests(ioq, aio->RequestCount);
+                    aio->IoStateFlags &=~IO_ASYNC_STATE_FLAG_SWAP;
+                    aio->RequestIndex  = 0;
+                }
+                if (aio->RequestIndex == aio->RequestCount)
+                {   // there are no more requests pending.
+                    // immediately terminate this loop and go back to sleep.
+                    break;
+                }
+            }
+
+            // consume zero or more requests from the current request buffer.
+            // terminate when all requests have been consumed, or there are 
+            // no more active request slots (there's a fixed-size pool.)
+            bool   out_of_slots = (rql->Count == rql->Capacity);
+            while (aio->RequestIndex != aio->RequestCount && !out_of_slots)
+            {
+                IO_REQUEST &req = aio->RequestBuffer[aio->RequestIndex];
+                size_t consumed = 0; // set to 1 if the request was consumed.
+                uint64_t launch = GetIoTimestamp();
+
+                // convert the application I/O request into a low-level I/O operation.
+                switch (req.RequestType)
+                {
+                    case IO_REQUEST_NOOP:
+                        { // there's no actual I/O operation to perform.
+                          if (req.IoComplete != NULL)
+                          {   IO_RESULT res;
+                              res.RequestType = req.RequestType;
+                              res.ResultCode  = ERROR_SUCCESS;
+                              res.UserContext = req.UserContext;
+                              res.FileHandle  = req.FileHandle;
+                              res.PathBuffer  = req.PathBuffer;
+                              res.DataBuffer  = req.DataBuffer;
+                              res.DataAmount  = req.DataAmount;
+                              res.BaseOffset  = req.BaseOffset;
+                              res.FileOffset  = req.FileOffset;
+                              req.IoComplete(res, NS_ELAPSED(req.SubmitTime, launch), NS_ELAPSED(launch, GetIoTimestamp()), true);
+                          }
+                          consumed = 1;
+                        } break;
+                    case IO_REQUEST_OPEN_FILE:
+                        { // populate the operation request for the file open operation.
+                          // open operations return more data than most requests, and are always performed synchronously.
+                          FILE_STANDARD_INFO  fsi = {};
+                          size_t      sector_size = 0;
+                          opreq.FilePath          = req.PathBuffer;
+                          opreq.FileHandle        = INVALID_HANDLE_VALUE;
+                          opreq.CompletionPort    = iocp;
+                          opreq.Overlapped        = NULL;
+                          opreq.DataBuffer        = NULL;
+                          opreq.FileOffset        = 0;
+                          opreq.PreallocationSize = req.DataAmount;
+                          opreq.TransferAmount    = 0;
+                          opreq.IoHintFlags       = req.IoHintFlags;
+                          IoExecuteOpen(opreq, opres, &fsi, &sector_size);
+                          if (req.IoComplete != NULL)
+                          {   IO_RESULT res;
+                              res.RequestType        = IO_REQUEST_OPEN_FILE;
+                              res.ResultCode         = opres.ResultCode;
+                              res.UserContext        = req.UserContext;
+                              res.FileHandle         = opres.FileHandle;
+                              res.PathBuffer         = req.PathBuffer;
+                              res.DataBuffer         = req.DataBuffer;
+                              res.FileSize           = fsi.EndOfFile.QuadPart;
+                              res.PhysicalSectorSize = sector_size;
+                              res.FileOffset         = 0;
+                              req.IoComplete(res, NS_ELAPSED(req.SubmitTime, launch), NS_ELAPSED(launch, GetIoTimestamp()), opres.WasSuccessful);
+                          }
+                          consumed = 1;
+                        } break;
+                    case IO_REQUEST_READ_FILE:
+                        { // read requests may complete asynchronously, so allocate an active request slot.
+                          IO_REQUEST_NODE *n = InitActiveIoRequest(req, rql, launch);
+                          if (n != NULL)
+                          {   // populate the operation request for the file read operation.
+                              // the read may complete synchronously or asynchronously.
+                              opreq.FilePath          = NULL;
+                              opreq.FileHandle        = req.FileHandle;
+                              opreq.CompletionPort    = NULL;
+                              opreq.Overlapped        =&n->Overlapped;
+                              opreq.DataBuffer        = req.DataBuffer;
+                              opreq.FileOffset        = req.BaseOffset + req.FileOffset;
+                              opreq.PreallocationSize = 0;
+                              opreq.TransferAmount    =(uint32_t) req.DataAmount;
+                              opreq.IoHintFlags       = IO_HINT_FLAGS_NONE;
+                              IoExecuteRead(opreq, opres);
+                              if (opres.CompletedSynchronously)
+                              {   // the operation completed synchronously, so retire the request.
+                                  if (req.IoComplete != NULL)
+                                  {   IO_RESULT res;
+                                      res.RequestType = IO_REQUEST_READ_FILE;
+                                      res.ResultCode  = opres.ResultCode;
+                                      res.UserContext = req.UserContext;
+                                      res.FileHandle  = req.FileHandle;
+                                      res.PathBuffer  = req.PathBuffer;
+                                      res.DataBuffer  = req.DataBuffer;
+                                      res.DataAmount  = opres.TransferAmount;
+                                      res.BaseOffset  = req.BaseOffset;
+                                      res.FileOffset  = req.FileOffset;
+                                      req.IoComplete(res, NS_ELAPSED(req.SubmitTime, launch), NS_ELAPSED(launch, GetIoTimestamp()), opres.WasSuccessful);
+                                  }
+                                  RetireActiveIoRequest(n, rql);
+                              }
+                              // the request was submitted, so consume it.
+                              consumed = 1;
+                          }
+                          else
+                          {   // there are no I/O requests available.
+                              out_of_slots = true;
+                              consumed = 0;
+                          }
+                        } break;
+                    case IO_REQUEST_WRITE_FILE:
+                        { // write requests may complete asynchronously, so allocate an active request slot.
+                          IO_REQUEST_NODE *n = InitActiveIoRequest(req, rql, launch);
+                          if (n != NULL)
+                          {   // populate the operation request for the file write operation.
+                              // the write may complete synchronously or asynchronously.
+                              opreq.FilePath          = NULL;
+                              opreq.FileHandle        = req.FileHandle;
+                              opreq.CompletionPort    = NULL;
+                              opreq.Overlapped        =&n->Overlapped;
+                              opreq.DataBuffer        = req.DataBuffer;
+                              opreq.FileOffset        = req.BaseOffset + req.FileOffset;
+                              opreq.PreallocationSize = 0;
+                              opreq.TransferAmount    =(uint32_t) req.DataAmount;
+                              opreq.IoHintFlags       = IO_HINT_FLAGS_NONE;
+                              IoExecuteWrite(opreq, opres);
+                              if (opres.CompletedSynchronously)
+                              {   // the operation completed synchronously, so retire the request.
+                                  if (req.IoComplete != NULL)
+                                  {   IO_RESULT res;
+                                      res.RequestType = IO_REQUEST_WRITE_FILE;
+                                      res.ResultCode  = opres.ResultCode;
+                                      res.UserContext = req.UserContext;
+                                      res.FileHandle  = req.FileHandle;
+                                      res.PathBuffer  = req.PathBuffer;
+                                      res.DataBuffer  = req.DataBuffer;
+                                      res.DataAmount  = opres.TransferAmount;
+                                      res.BaseOffset  = req.BaseOffset;
+                                      res.FileOffset  = req.FileOffset;
+                                      req.IoComplete(res, NS_ELAPSED(req.SubmitTime, launch), NS_ELAPSED(launch, GetIoTimestamp()), opres.WasSuccessful);
+                                  }
+                                  RetireActiveIoRequest(n, rql);
+                              }
+                              // the request was submitted, so consume it.
+                              consumed = 1;
+                          }
+                          else
+                          {   // there are no I/O requests available.
+                              out_of_slots = true;
+                              consumed = 0;
+                          }
+                        } break;
+                    case IO_REQUEST_FLUSH_FILE:
+                        { // populate the operation request for the flush operation.
+                          // flush operations are always performed synchronously.
+                          opreq.FilePath          = NULL;
+                          opreq.FileHandle        = req.FileHandle;
+                          opreq.CompletionPort    = NULL;
+                          opreq.Overlapped        = NULL;
+                          opreq.DataBuffer        = NULL;
+                          opreq.FileOffset        = 0;
+                          opreq.PreallocationSize = 0;
+                          opreq.TransferAmount    = 0;
+                          opreq.IoHintFlags       = IO_HINT_FLAGS_NONE;
+                          IoExecuteFlush(opreq, opres);
+                          if (req.IoComplete != NULL)
+                          {   IO_RESULT res;
+                              res.RequestType = IO_REQUEST_FLUSH_FILE;
+                              res.ResultCode  = opres.ResultCode;
+                              res.UserContext = req.UserContext;
+                              res.FileHandle  = req.FileHandle;
+                              res.PathBuffer  = req.PathBuffer;
+                              res.DataBuffer  = req.DataBuffer;
+                              res.DataAmount  = req.DataAmount;
+                              res.BaseOffset  = req.BaseOffset;
+                              res.FileOffset  = req.FileOffset;
+                              req.IoComplete(res, NS_ELAPSED(req.SubmitTime, launch), NS_ELAPSED(launch, GetIoTimestamp()), opres.WasSuccessful);
+                          }
+                          consumed = 1;
+                        } break;
+                    case IO_REQUEST_CLOSE_FILE:
+                        { // populate the operation request for the close operation.
+                          // close operations are always performed synchronously.
+                          opreq.FilePath          = NULL;
+                          opreq.FileHandle        = req.FileHandle;
+                          opreq.CompletionPort    = NULL;
+                          opreq.Overlapped        = NULL;
+                          opreq.DataBuffer        = NULL;
+                          opreq.FileOffset        = 0;
+                          opreq.PreallocationSize = 0;
+                          opreq.TransferAmount    = 0;
+                          opreq.IoHintFlags       = IO_HINT_FLAGS_NONE;
+                          IoExecuteClose(opreq, opres);
+                          if (req.IoComplete != NULL)
+                          {   IO_RESULT res;
+                              res.RequestType = IO_REQUEST_CLOSE_FILE;
+                              res.ResultCode  = opres.ResultCode;
+                              res.UserContext = req.UserContext;
+                              res.FileHandle  = req.FileHandle;
+                              res.PathBuffer  = req.PathBuffer;
+                              res.DataBuffer  = req.DataBuffer;
+                              res.DataAmount  = req.DataAmount;
+                              res.BaseOffset  = req.BaseOffset;
+                              res.FileOffset  = req.FileOffset;
+                              req.IoComplete(res, NS_ELAPSED(req.SubmitTime, launch), NS_ELAPSED(launch, GetIoTimestamp()), opres.WasSuccessful);
+                          }
+                          consumed = 1;
+                        } break;
+                    default:
+                        { // don't know what this is - just pass through data.
+                          if (req.IoComplete != NULL)
+                          {   IO_RESULT res;
+                              res.RequestType = req.RequestType;
+                              res.ResultCode  = ERROR_SUCCESS;
+                              res.UserContext = req.UserContext;
+                              res.FileHandle  = req.FileHandle;
+                              res.PathBuffer  = req.PathBuffer;
+                              res.DataBuffer  = req.DataBuffer;
+                              res.DataAmount  = req.DataAmount;
+                              res.BaseOffset  = req.BaseOffset;
+                              res.FileOffset  = req.FileOffset;
+                              req.IoComplete(res, NS_ELAPSED(req.SubmitTime, launch), NS_ELAPSED(launch, GetIoTimestamp()), true);
+                          }
+                          consumed = 1;
+                        } break;
+                }
+
+                // consume zero or one application I/O requests from the buffer.
+                aio->RequestIndex += consumed;
+                out_of_slots       =(consumed == 0);
+            }
+        }
+    }
+
+#undef NS_ELAPSED
+
+terminate_thread:
+    return 0;
+}
 
