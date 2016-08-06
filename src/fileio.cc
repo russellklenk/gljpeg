@@ -1932,3 +1932,41 @@ terminate_thread:
     return 0;
 }
 
+public_function int
+IoCreateBackgroundThread
+(
+    IO_BACKGROUND_THREAD        *io_thread, 
+    IO_BACKGROUND_THREAD_INIT *thread_init
+)
+{
+}
+
+struct IO_BACKGROUND_THREAD_ARGS
+{
+    IO_ASYNC_STATE     *AIOState;                   /// The asynchronous I/O state data used to track in-flight asynchronous I/O requests submitted to the kernel.
+    IO_REQUEST_QUEUE   *AIOQueue;                   /// The I/O request queue used to submit requests to the I/O thread from the application.
+};
+
+/// @summary Define the data maintained by a background I/O thread.
+struct IO_BACKGROUND_THREAD
+{
+    HANDLE              ThreadHandle;               /// The operating system thread handle, which can be used to wait for the thread to exit.
+    unsigned int        ThreadId;                   /// The operating system thread identifier.
+    uint32_t            DefaultHints_Open;          /// The application's default IO_HINT_FLAGS to be applied for OPEN requests.
+    uint32_t            DefaultHints_Load;          /// The application's default IO_HINT_FLAGS to be applied for LOAD requests.
+    uint32_t            DefaultHints_Save;          /// The application's default IO_HINT_FLAGS to be applied for SAVE requests.
+    IO_ASYNC_STATE      AIOState;                   /// The data used to track in-flight asynchronous I/O requests.
+    IO_REQUEST_QUEUE    AIOQueue;                   /// The queue used to submit I/O requests to the background I/O thread.
+};
+
+/// @summary Define the parameters that can be set by the application to configure background I/O behavior.
+struct IO_BACKGROUND_THREAD_INIT
+{
+    size_t              MaxRequestsQueued;          /// The maximum number of I/O requests that can be queued by the application.
+    size_t              MaxRequestsActive;          /// The maximum number of I/O operations that can be submitted to the kernel, but not completed, at any given time.
+    size_t              EventDequeueCount;          /// The maximum number of I/O completion events to receive at once.
+    uint32_t            DefaultHints_Open;          /// The application's default IO_HINT_FLAGS to be applied for OPEN requests.
+    uint32_t            DefaultHints_Load;          /// The application's default IO_HINT_FLAGS to be applied for LOAD requests.
+    uint32_t            DefaultHints_Save;          /// The application's default IO_HINT_FLAGS to be applied for SAVE requests.
+};
+
