@@ -1168,8 +1168,10 @@ IoCreateRequest
             node->RequestPool = pool;
             if (pool->LiveRequest != NULL)
                 pool->LiveRequest->PrevRequest = node;
-            pool->LiveRequest = node;
+            pool->LiveRequest  = node;
             node->RequestState = IO_REQUEST_STATE_CHAINED;
+            node->QueueSpan    = NULL;
+            node->ExecuteSpan  = NULL;
         }
     }
     LeaveCriticalSection(&pool->ListLock);
