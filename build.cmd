@@ -57,7 +57,9 @@ cl %CPPFLAGS% ..\src\main.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fe%GLJPEGEXE%
 cl %CPPFLAGS% ..\src\dbenchst.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedbenchst.exe
 cl %CPPFLAGS% ..\src\dbenchmt.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedbenchmt.exe
 cl %CPPFLAGS% ..\src\decodemt.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedecodemt.exe
+cl %CPPFLAGS% ..\src\decodemtm.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedecodemtm.exe
 cl %CPPFLAGS% ..\src\decodemta.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedecodemta.exe
+cl %CPPFLAGS% ..\src\decodemtu.cc %DEFINES% %LIBRARIES% %LNKFLAGS% /Fedecodemtu.exe
 POPD
 
 GOTO BUILD_COMPLETE
