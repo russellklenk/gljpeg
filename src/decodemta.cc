@@ -107,6 +107,7 @@
 #include "cvmarkers.h"
 
 #include "fileio.cc"
+#include "asyncio.cc"
 #include "threadpool.cc"
 #include "decompress.cc"
 
@@ -123,8 +124,9 @@ struct JPEG_FILE_DATA
 struct SHARED_DATA
 {
     THREAD_POOL      *WorkerPool;
-    IO_REQUEST_QUEUE *IOQueue;
-    HANDLE            IOSemaphore;
+    IO_THREAD_POOL   *IoPool;
+    IO_REQUEST_POOL  *IoRequestPool;
+    HANDLE            IoSemaphore;
     HANDLE            AllDone;
     size_t            TotalFiles;
     JPEG_FILE_DATA   *FileList;
@@ -153,121 +155,133 @@ CompleteFile
     SHARED_DATA *shared_data
 )
 {
-    ReleaseSemaphore(shared_data->IOSemaphore, 1, NULL);
+    ReleaseSemaphore(shared_data->IoSemaphore, 1, NULL);
 }
 
 /// @summary Callback executed when an asynchronous file read request has completed.
 /// @param result An IO_RESULT used to return data to the caller.
-/// @param queue_delay The number of nanoseconds elapsed between the application submitting the request and the background I/O thread executing the request.
-/// @param execution_time The number of nanoseconds elapsed between the background I/O thread executing the request and the request completing.
+/// @param request_pool The I/O request pool from which the request was allocated.
+/// @param io_pool The I/O thread pool that executed the request.
 /// @param was_successful Set to true if the operation completed successfully.
-internal_function void
+/// @return A chained I/O request to execute immediately, or NULL.
+internal_function IO_REQUEST*
 FileClose_Complete
 (
-    IO_RESULT        result, 
-    uint64_t    queue_delay, 
-    uint64_t execution_time, 
-    bool     was_successful
+    IO_RESULT             *result, 
+    IO_REQUEST_POOL *request_pool,
+    IO_THREAD_POOL       *io_pool,
+    bool           was_successful
 )
 {
-    SHARED_DATA *shared = (SHARED_DATA*) result.UserContext;
+    SHARED_DATA *shared = (SHARED_DATA*) result->UserContext;
     CompleteFile(shared);
-    UNREFERENCED_PARAMETER(queue_delay);
-    UNREFERENCED_PARAMETER(execution_time);
+    UNREFERENCED_PARAMETER(io_pool);
+    UNREFERENCED_PARAMETER(request_pool);
     UNREFERENCED_PARAMETER(was_successful);
+    return NULL;
 }
 
 /// @summary Callback executed when an asynchronous file read request has completed.
 /// @param result An IO_RESULT used to return data to the caller.
-/// @param queue_delay The number of nanoseconds elapsed between the application submitting the request and the background I/O thread executing the request.
-/// @param execution_time The number of nanoseconds elapsed between the background I/O thread executing the request and the request completing.
+/// @param request_pool The I/O request pool from which the request was allocated.
+/// @param io_pool The I/O thread pool that executed the request.
 /// @param was_successful Set to true if the operation completed successfully.
-internal_function void
+/// @return A chained I/O request to execute immediately, or NULL.
+internal_function IO_REQUEST*
 FileRead_Complete
 (
-    IO_RESULT        result, 
-    uint64_t    queue_delay, 
-    uint64_t execution_time, 
-    bool     was_successful
+    IO_RESULT             *result, 
+    IO_REQUEST_POOL *request_pool,
+    IO_THREAD_POOL       *io_pool,
+    bool           was_successful
 )
 {
-    SHARED_DATA *shared = (SHARED_DATA*) result.UserContext;
+    SHARED_DATA *shared = (SHARED_DATA*) result->UserContext;
     if (was_successful)
     {   // queue the file close operation.
-        IO_REQUEST  req = {};
-        req.RequestType = IO_REQUEST_CLOSE_FILE;
-        req.IoHintFlags = IO_HINT_FLAGS_NONE;
-        req.UserContext = result.UserContext;
-        req.FileHandle  = result.FileHandle;
-        req.SubmitTime  = GetIoTimestamp();
-        req.IoComplete  = FileClose_Complete;
-        IoEnqueueRequest(shared->IOQueue, req);
+        IO_REQUEST *req = IoCreateRequest(request_pool);
+        if (req != NULL)
+        {
+            req->RequestType = IO_REQUEST_CLOSE_FILE;
+            req->UserContext = result->UserContext;
+            req->FileHandle  = result->FileHandle;
+            req->PathBuffer  = result->PathBuffer;
+            req->DataBuffer  = NULL;
+            req->DataAmount  = 0;
+            req->BaseOffset  = 0;
+            req->FileOffset  = 0;
+            req->CompletionCallback = FileClose_Complete;
+        }
         // submit a job for the decompression pool.
         EnterCriticalSection(&shared->SyncObj);
         {
             JPEG_FILE_DATA &jpeg = shared->FileList[shared->FileCount];
-            jpeg.Path     = result.PathBuffer;
-            jpeg.Buffer   = result.DataBuffer;
-            jpeg.DataSize = result.DataAmount;
+            jpeg.Path     = result->PathBuffer;
+            jpeg.Buffer   = result->DataBuffer;
+            jpeg.DataSize = result->DataAmount;
             shared->FileCount++;
         }
         LeaveCriticalSection(&shared->SyncObj);
         TpSignalWorkerThreads(shared->WorkerPool, SIGNAL_DECOMPRESS_JPEG, 1);
+        return req;
     }
     else
     {   // terminate the call chain.
         CompleteFile(shared);
+        return NULL;
     }
-    UNREFERENCED_PARAMETER(queue_delay);
-    UNREFERENCED_PARAMETER(execution_time);
+    UNREFERENCED_PARAMETER(io_pool);
 }
 
 /// @summary Callback executed when an asynchronous file open request has completed.
 /// @param result An IO_RESULT used to return data to the caller.
-/// @param queue_delay The number of nanoseconds elapsed between the application submitting the request and the background I/O thread executing the request.
-/// @param execution_time The number of nanoseconds elapsed between the background I/O thread executing the request and the request completing.
+/// @param request_pool The I/O request pool from which the request was allocated.
+/// @param io_pool The I/O thread pool that executed the request.
 /// @param was_successful Set to true if the operation completed successfully.
-internal_function void 
+/// @return A chained I/O request to execute immediately, or NULL.
+internal_function IO_REQUEST* 
 FileOpen_Complete
 (
-    IO_RESULT        result, 
-    uint64_t    queue_delay, 
-    uint64_t execution_time, 
-    bool     was_successful
+    IO_RESULT             *result, 
+    IO_REQUEST_POOL *request_pool,
+    IO_THREAD_POOL       *io_pool,
+    bool           was_successful
 )
 {
-    SHARED_DATA *shared = (SHARED_DATA*) result.UserContext;
+    SHARED_DATA *shared = (SHARED_DATA*) result->UserContext;
     if (was_successful)
     {   // allocate a buffer for the file contents. 
         void  *data_buf = NULL;
-        if   ((data_buf = malloc(result.FileSize)) == NULL)
+        if   ((data_buf = malloc(result->FileSize)) == NULL)
         {   // terminate the call chain; we're out of memory.
-            ConsoleError("ERROR: %S(%u): Cannot allocate %I64d bytes for file \"%s\".\n", __FUNCTION__, GetCurrentThreadId(), result.FileSize, result.PathBuffer);
+            ConsoleError("ERROR: %S(%u): Cannot allocate %I64d bytes for file \"%s\".\n", __FUNCTION__, GetCurrentThreadId(), result->FileSize, result->PathBuffer);
             CompleteFile(shared);
-            return;
+            return NULL;
         }
         // submit the read request for the entire file contents.
         // this request should execute asynchronously.
-        IO_REQUEST  req = {};
-        req.RequestType = IO_REQUEST_READ_FILE;
-        req.IoHintFlags = IO_HINT_FLAGS_NONE;
-        req.UserContext = result.UserContext;
-        req.FileHandle  = result.FileHandle;
-        req.PathBuffer  = result.PathBuffer; // pass this through
-        req.DataBuffer  = data_buf;
-        req.DataAmount  = result.FileSize;
-        req.BaseOffset  = 0;
-        req.FileOffset  = 0;
-        req.SubmitTime  = GetIoTimestamp();
-        req.IoComplete  = FileRead_Complete;
-        IoEnqueueRequest(shared->IOQueue, req);
+        IO_REQUEST *req = IoCreateRequest(request_pool);
+        if (req != NULL)
+        {
+            req->RequestType = IO_REQUEST_READ_FILE;
+            req->IoHintFlags = IO_HINT_FLAGS_NONE;
+            req->UserContext = result->UserContext;
+            req->FileHandle  = result->FileHandle;
+            req->PathBuffer  = result->PathBuffer;
+            req->DataBuffer  = data_buf;
+            req->DataAmount  = result->FileSize;
+            req->BaseOffset  = 0;
+            req->FileOffset  = 0;
+            req->CompletionCallback = FileRead_Complete;
+        }
+        return req;
     }
     else
     {   // terminate the call chain.
         CompleteFile(shared);
+        return NULL;
     }
-    UNREFERENCED_PARAMETER(queue_delay);
-    UNREFERENCED_PARAMETER(execution_time);
+    UNREFERENCED_PARAMETER(io_pool);
 }
 
 internal_function bool GetWorkItem
@@ -454,10 +468,11 @@ main
 )
 {
     SHARED_DATA                shared = {};
+    IO_THREAD_POOL            io_pool = {};
+    IO_THREAD_POOL_INIT  io_pool_init = {};
+    IO_REQUEST_POOL      request_pool = {};
     THREAD_POOL_INIT        pool_init = {};
     THREAD_POOL                  pool = {};
-    IO_BACKGROUND_THREAD    io_thread = {};
-    IO_BACKGROUND_THREAD_INIT io_init = {};
     CPU_INFO                      cpu = {};
     FILE_LIST               file_list = {};
     JPEG_FILE_DATA         *jpeg_list = NULL;
@@ -476,22 +491,9 @@ main
         ConsoleError("ERROR: %S(%u): Failed to query the host CPU layout.\n", __FUNCTION__, GetCurrentThreadId());
         return -1;
     }
-
-    // set up the background I/O thread and launch it.
-    // there can be 64 files in-flight at any given time, and up to two active requests per-file.
-    io_init.MaxRequestsQueued = 1024;
-    io_init.MaxRequestsActive = 128;
-    io_init.EventDequeueCount = 128;
-    io_init.DefaultHints      = IO_HINT_FLAG_READ | IO_HINT_FLAG_SEQUENTIAL;
-    if (IoCreateBackgroundThread(&io_thread, &io_init) < 0)
-    {
-        ConsoleError("ERROR: %S(%u): Failed to create background I/O thread.\n", __FUNCTION__, GetCurrentThreadId());
-        return -1;
-    }
     if (IoEnumerateDirectoryFiles(file_list, "data", true) < 0 || file_list.size() == 0)
     {
         ConsoleError("ERROR: %S(%u): The data directory is empty.\n", __FUNCTION__, GetCurrentThreadId());
-        IoTerminateBackgroundThread(&io_thread);
         return -1;
     }
     else
@@ -499,22 +501,40 @@ main
         if ((jpeg_list = (JPEG_FILE_DATA*) malloc(file_list.size() * sizeof(JPEG_FILE_DATA))) == NULL)
         {
             ConsoleError("ERROR: %S(%u): Failed to allocate memory for JPEG list.\n", __FUNCTION__, GetCurrentThreadId());
-            IoTerminateBackgroundThread(&io_thread);
             return -1;
         }
         IoSortFileList(file_list);
         InitializeCriticalSection(&shared.SyncObj);
-        shared.WorkerPool  = &pool;
-        shared.IOQueue     = IoGetBackgroundRequestQueue(&io_thread);
-        shared.IOSemaphore = qsem;
-        shared.AllDone     = CreateEvent(NULL, TRUE, FALSE, NULL);
-        shared.TotalFiles  = file_list.size();
-        shared.FileList    = jpeg_list;
-        shared.FileCount   = 0;
-        shared.NextFile    = 0;
+        shared.IoPool        = &io_pool;
+        shared.IoSemaphore   = qsem;
+        shared.IoRequestPool = &request_pool;
+        shared.WorkerPool    = &pool;
+        shared.AllDone       = CreateEvent(NULL, TRUE, FALSE, NULL);
+        shared.TotalFiles    = file_list.size();
+        shared.FileList      = jpeg_list;
+        shared.FileCount     = 0;
+        shared.NextFile      = 0;
     }
 
-    // set up the thread pool.
+    // set up the I/O request pool. all threads allocate requests from the same pool.
+    if (IoCreateRequestPool(&request_pool, 16384) < 0)
+    {
+        ConsoleError("ERROR: %S(%u): Failed to create I/O request pool.\n", __FUNCTION__, GetCurrentThreadId());
+        return -1;
+    }
+
+    // set up the I/O thread pool. since we'll be loading many small files, 
+    // we'd like to have quite a few threads to handle synchronous I/O operations.
+    // the threads in the I/O pool start running automatically.
+    io_pool_init.ThreadCount = 64;
+    io_pool_init.PoolContext = 0;
+    if (IoCreateThreadPool(&io_pool, &io_pool_init, "I/O Thread Pool") < 0)
+    {
+        ConsoleError("ERROR: %S(%u): Failed to create the I/O thread pool.\n", __FUNCTION__, GetCurrentThreadId());
+        return -1;
+    }
+
+    // set up the JPEG decompression thread pool.
     pool_init.ThreadInit  = WorkerInit;
     pool_init.ThreadMain  = WorkerMain;
     pool_init.PoolContext = &shared;
@@ -524,7 +544,7 @@ main
     if (TpCreateThreadPool(&pool, &pool_init, "Decompression Thread Pool") < 0)
     {
         ConsoleError("ERROR: %S(%u): Failed to create the image decompression thread pool.\n", __FUNCTION__, GetCurrentThreadId());
-        IoTerminateBackgroundThread(&io_thread);
+        IoTerminateThreadPool(&io_pool);
         return -1;
     }
 
@@ -539,28 +559,27 @@ main
         {   // there's a serious error - bail out like we're finished.
             break;
         }
-        IO_REQUEST req;
-        size_t n_posted = 0;
-        do
-        {   // fill out the asynchronous file open request. this will execute on the background I/O thread.
-            req.RequestType = IO_REQUEST_OPEN_FILE;
-            req.IoHintFlags = IO_HINT_FLAG_READ | IO_HINT_FLAG_SEQUENTIAL;
-            req.UserContext =(uintptr_t)   &shared;
-            req.FileHandle  = INVALID_HANDLE_VALUE;
-            req.PathBuffer  = file_list[i].Path;
-            req.DataBuffer  = NULL;
-            req.DataAmount  = 0;
-            req.BaseOffset  = 0;
-            req.FileOffset  = 0;
-            req.SubmitTime  = GetIoTimestamp(); // TODO(rlk): make public
-            req.IoComplete  = FileOpen_Complete;
-        } while ((n_posted  = IoEnqueueRequest(IoGetBackgroundRequestQueue(&io_thread), req)) == 0);
+        IO_REQUEST *req = IoCreateRequest(&request_pool);
+        if (req != NULL)
+        {
+            req->RequestType = IO_REQUEST_OPEN_FILE;
+            req->IoHintFlags = IO_HINT_FLAG_READ | IO_HINT_FLAG_SEQUENTIAL;
+            req->UserContext =(uintptr_t) &shared;
+            req->FileHandle  = INVALID_HANDLE_VALUE;
+            req->PathBuffer  = file_list[i].Path;
+            req->DataBuffer  = NULL;
+            req->DataAmount  = 0;
+            req->BaseOffset  = 0;
+            req->FileOffset  = 0;
+            req->CompletionCallback = FileOpen_Complete;
+            IoSubmitRequest(&io_pool, req);
+        }
     }
 
     // wait until all files have been decompressed, and then shut down.
     WaitForSingleObject(shared.AllDone, INFINITE);
+    IoDestroyThreadPool(&io_pool);
     TpDestroyThreadPool(&pool);
-    IoTerminateBackgroundThread(&io_thread);
     CloseHandle(shared.AllDone);
     return 0;
 }
