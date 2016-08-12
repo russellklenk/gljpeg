@@ -524,9 +524,9 @@ main
     }
 
     // set up the I/O thread pool. since we'll be loading many small files, 
-    // we'd like to have quite a few threads to handle synchronous I/O operations.
-    // the threads in the I/O pool start running automatically.
-    io_pool_init.ThreadCount = 64;
+    // we need more than one thread. the CPU supports SMT, so ideally context 
+    // switches to the I/O threads will happen on the additional hardware threads.
+    io_pool_init.ThreadCount = cpu.PhysicalCores;
     io_pool_init.PoolContext = 0;
     if (IoCreateThreadPool(&io_pool, &io_pool_init, "I/O Thread Pool") < 0)
     {
@@ -535,6 +535,8 @@ main
     }
 
     // set up the JPEG decompression thread pool.
+    // since this is almost entirely compute-bound, make sure that there are enough
+    // threads to process available work, but do not over-subscribe the CPU.
     pool_init.ThreadInit  = WorkerInit;
     pool_init.ThreadMain  = WorkerMain;
     pool_init.PoolContext = &shared;
